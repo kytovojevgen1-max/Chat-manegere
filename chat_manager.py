@@ -16,8 +16,8 @@ MAIN_OWNER_ID = 897082738
 DB_FILE = "bot_database.json"
 START_TIME = time.time()
 
-DEFAULT_PROJECT_NAME = "PROJECT CORE"
-DEFAULT_PROJECT_URL = "https://vk.com"
+DEFAULT_PROJECT_NAME = "GAMES | Чат Менеджер"
+DEFAULT_PROJECT_URL = "https://vk.com/GamesChatMeneger"
 DEFAULT_RULES = (
     "📜 ═══ ПРАВИЛА БЕСЕДЫ ═══ 📜\n\n"
     "1. Запрещён спам, флуд и реклама сторонних ресурсов.\n"
