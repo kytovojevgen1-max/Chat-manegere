@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import secrets
 import asyncio
 from threading import Thread
 from flask import Flask
@@ -10,12 +11,16 @@ from vkbottle import Keyboard, KeyboardButtonColor, Text
 # =====================================================================
 # 1. НАСТРОЙКИ СБОРКИ (МЕНЯЮТСЯ В ОДНОМ МЕСТЕ ПОД ЛЮБОЙ ПРОЕКТ)
 # =====================================================================
-TOKEN = "vk1.a.5BfnzsvcbvRGCC9ZGxmbKdzOU-0NBWIPc9RovnKuIImAHcV46i4wMJUGvrkua3xKhDqo57KVoiXQOqhuctwA93--pk54OWAy_rfzgGfTTQFdG1vFzRObXKPTikSt3h1rRR6ImqGbPMaOgAC3vLaPxx359f9T4N2nl2d4dZGFInNv4F9LLsctf3GiuJfrBkqBcji79CiXrPLqeClPoXaptg"
-MAIN_OWNER_ID = 897082738  # Главный VK ID владельца бота (для ЛС-рассылки)
+TOKEN = "vk1.a.qGTN_rCK6d4Yg4ty8YkruE6DbovbX5lwzHcQcN6wQ15aACfSrhsyi5F7R9xip5mq03EeLvxI2gZwJSVvuWMv0eP7vv59FFJvPNYWpRI7R2nzXM0gbobnLpmRaI3yM751Cml4ZOPDcIc380c3hekN0jgZ3QeP76p9hn1Sw6kwK6mOCyomwB33nVy1uBGAbC0mDQpu5eiq2HlVDAKi4YjHYw"
+MAIN_OWNER_ID = 897082738  # Главный VK ID владельца бота (ЛС-панель, генерация кодов, рассылка)
 
 DEFAULT_PROJECT_NAME = "CHAT MANAGER"
 DEFAULT_PROJECT_URL = "https://vk.com"
 DB_FILE = "chat_manager_db.json"
+
+MAX_CHATS_PER_CODE = 15          # Жёсткий лимит: максимум 15 чатов на 1 код активации
+REQUIRE_GLOBAL_POOL = True       # True = команды /г... и /g... работают ТОЛЬКО по пулу (коду до 15 чатов)
+REQUIRE_NICK_ROLES_POOL = True   # True = отдельный пул «Ники и роли» включается кодом (или вручную владельцем бота)
 
 DEFAULT_ROLES = {
     100: "👑 Владелец / Основатель",
@@ -81,19 +86,20 @@ def save_db(data):
         print(f"Ошибка сохранения БД: {e}")
 
 db = load_db()
-if "chats" not in db: db["chats"] = {}
-if "global_chats" not in db: db["global_chats"] = []
-if "broadcast_admins" not in db: db["broadcast_admins"] = [MAIN_OWNER_ID]
-if "global_roles" not in db: db["global_roles"] = {}
-if "global_bans" not in db: db["global_bans"] = {}
-if "leaders" not in db: db["leaders"] = {}
-if "reports" not in db: db["reports"] = []
-if "logs" not in db: db["logs"] = []
+db.setdefault("chats", {})
+db.setdefault("global_chats", [])
+db.setdefault("broadcast_admins", [MAIN_OWNER_ID])
+db.setdefault("global_roles", {})
+db.setdefault("global_bans", {})
+db.setdefault("leaders", {})
+db.setdefault("reports", [])
+db.setdefault("logs", [])
+db.setdefault("pool_codes", {})  # { "CODE": {"type": "global"|"nick_roles"|"all", "max_chats": 15, "chats": [peer_id], "created_by": uid, "created_at": str} }
 
 user_states = {}
 user_cache = {}
 
-def add_log(text):
+def add_log(text: str):
     timestamp = time.strftime("[%Y-%m-%d %H:%M:%S]")
     entry = f"{timestamp} {text}"
     db["logs"].append(entry)
@@ -101,7 +107,7 @@ def add_log(text):
         db["logs"].pop(0)
     save_db(db)
 
-def get_chat_data(peer_id):
+def get_chat_data(peer_id: int) -> dict:
     p_str = str(peer_id)
     if p_str not in db["chats"]:
         db["chats"][p_str] = {
@@ -115,7 +121,13 @@ def get_chat_data(peer_id):
             "project_url": DEFAULT_PROJECT_URL,
             "welcomed": False,
             "owner_id": None,
-            "antispam": False
+            "antispam": False,
+            "pools": {
+                "global_cmds": False,
+                "nick_roles": False,
+                "global_code": None,
+                "nick_roles_code": None
+            }
         }
     chat = db["chats"][p_str]
     chat.setdefault("members", {})
@@ -129,23 +141,125 @@ def get_chat_data(peer_id):
     chat.setdefault("welcomed", False)
     chat.setdefault("owner_id", None)
     chat.setdefault("antispam", False)
+    chat.setdefault("pools", {
+        "global_cmds": False,
+        "nick_roles": False,
+        "global_code": None,
+        "nick_roles_code": None
+    })
+    chat["pools"].setdefault("global_cmds", False)
+    chat["pools"].setdefault("nick_roles", False)
+    chat["pools"].setdefault("global_code", None)
+    chat["pools"].setdefault("nick_roles_code", None)
     return chat
+
+
+# =====================================================================
+# 4. ЛОГИКА ПУЛОВ И КОДОВ АКТИВАЦИИ (МАКС. 15 ЧАТОВ НА 1 КОД)
+# =====================================================================
+
+def create_pool_code(pool_type: str, custom_code: str | None, max_chats: int, created_by: int) -> tuple[bool, str]:
+    limit = max(1, min(int(max_chats), MAX_CHATS_PER_CODE))
+    if custom_code:
+        code = custom_code.strip().upper().replace(" ", "-")
+    else:
+        prefix = "GLB" if pool_type == "global" else ("NR" if pool_type == "nick_roles" else "FULL")
+        code = f"{prefix}-{secrets.token_hex(3).upper()}"
+
+    if not code or len(code) > 32:
+        return False, "❌ Код должен быть от 1 до 32 символов."
+    if code in db["pool_codes"]:
+        return False, f"❌ Код `{code}` уже существует."
+
+    db["pool_codes"][code] = {
+        "type": pool_type,  # "global" (/г... /g...), "nick_roles" (ники и роли), "all" (оба пула)
+        "max_chats": limit,
+        "chats": [],
+        "created_by": created_by,
+        "created_at": time.strftime("%Y-%m-%d %H:%M")
+    }
+    save_db(db)
+    return True, code
+
+def activate_pool_code_for_chat(peer_id: int, raw_code: str) -> tuple[bool, str]:
+    code = raw_code.strip().upper()
+    code_obj = db.get("pool_codes", {}).get(code)
+    if not code_obj:
+        return False, "❌ Неверный или несуществующий код активации."
+
+    used_chats = [int(c) for c in code_obj.get("chats", [])]
+    max_chats = min(int(code_obj.get("max_chats", MAX_CHATS_PER_CODE)), MAX_CHATS_PER_CODE)
+
+    if peer_id in used_chats:
+        return False, f"ℹ️ Код `{code}` уже активирован в этой беседе (`{len(used_chats)}/{max_chats}` чатов)."
+
+    if len(used_chats) >= max_chats:
+        return False, f"⛔ Лимит кода `{code}` исчерпан (`{len(used_chats)}/{max_chats}` чатов максимум)!"
+
+    used_chats.append(peer_id)
+    code_obj["chats"] = used_chats
+
+    chat_data = get_chat_data(peer_id)
+    pools = chat_data["pools"]
+    p_type = code_obj.get("type", "global")
+
+    activated_names = []
+    if p_type in ("global", "all"):
+        pools["global_cmds"] = True
+        pools["global_code"] = code
+        activated_names.append("🌐 Пул глобальных команд (`/г...` и `/g...`)")
+    if p_type in ("nick_roles", "all"):
+        pools["nick_roles"] = True
+        pools["nick_roles_code"] = code
+        activated_names.append("🎭 Отдельный пул «Ники и роли»")
+
+    save_db(db)
+    add_log(f"Активирован код {code} ({p_type}) в чате {peer_id} [{len(used_chats)}/{max_chats}]")
+    return True, (
+        f"✅ **Код `{code}` успешно активирован!**\n"
+        f"• Подключено: {' + '.join(activated_names)}\n"
+        f"• Использовано мест по коду: `{len(used_chats)}/{max_chats}` бесед"
+    )
+
+def has_global_pool(chat_data: dict) -> bool:
+    if not REQUIRE_GLOBAL_POOL:
+        return True
+    pools = chat_data.get("pools", {})
+    if not pools.get("global_cmds"):
+        return False
+    code = pools.get("global_code")
+    if code and code in db.get("pool_codes", {}):
+        return True
+    return bool(pools.get("global_cmds"))
+
+def has_nick_roles_pool(chat_data: dict) -> bool:
+    if not REQUIRE_NICK_ROLES_POOL:
+        return True
+    pools = chat_data.get("pools", {})
+    if not pools.get("nick_roles"):
+        return False
+    code = pools.get("nick_roles_code")
+    if code and code in db.get("pool_codes", {}):
+        return True
+    return bool(pools.get("nick_roles"))
+
+
+# =====================================================================
+# 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ЧАТА И VK API
+# =====================================================================
 
 def build_welcome_guide(chat_data: dict) -> str:
     proj = chat_data.get("project_name", DEFAULT_PROJECT_NAME)
     return (
         f"👋 **Привет! Чат-менеджер {proj} подключен к беседе!**\n\n"
         "👑 **Владелец чата получает `100 lvl` админки** и отображается в `/admins` (`/админс`) и `/stats` (`/стата`).\n"
-        "Если бот не определил создателя автоматически — прописать `/явладелец` может только **создатель или администратор беседы (со звездой)**.\n"
-        "📌 *Совет:* выдай боту права администратора в беседе, чтобы работали кики, баны, муты, очистка и закреп сообщений.\n\n"
+        "Если создатель не определился автоматически — прописать `/явладелец` может только **создатель или администратор беседы (со звездой)**.\n"
+        "📌 *Совет:* выдай боту права администратора в беседе, чтобы работали кики, баны, муты, очистка и закреп.\n\n"
         "⚡ **Быстрый старт:**\n"
         "• `/menu` или `меню` — интерактивные кнопки в беседе\n"
         "• `/help` или `/хелп` — полный список команд\n"
-        "• `/репорт [текст]` — отправить обращение администрации\n"
-        "• `/сник @ник [Ник]` — выдать ник (60+ lvl)\n"
-        "• `/сетадмин @ник [ур]` — выдать уровень прав (70+ lvl)\n"
-        "• `/сетправила [текст]` — изменить правила чата (70+ lvl)\n"
-        "• `/новаяроль [ур] [Название]` и `/удалитьроль [ур]` — настройка ролей (90+ lvl)"
+        "• `/код [КЛЮЧ]` — активировать пул (`/г...` / `/g...` или «Ники и роли», до 15 чатов на код)\n"
+        "• `/пул` — статус активных пулов беседы"
     )
 
 def sync_owner_member(chat_data: dict, owner_id: int | None):
@@ -162,7 +276,7 @@ def sync_owner_member(chat_data: dict, owner_id: int | None):
         }
 
 async def get_vk_chat_member_flags(peer_id: int, target_uid: int) -> tuple[bool, bool]:
-    """Возвращает (is_owner, is_admin) из VK API для участника беседы (серая звезда = is_admin)."""
+    """Проверяет is_owner (создатель) и is_admin (серая звезда) через VK API."""
     try:
         members_res = await bot.api.messages.get_conversation_members(peer_id=peer_id)
         if members_res and getattr(members_res, "items", None):
@@ -175,7 +289,7 @@ async def get_vk_chat_member_flags(peer_id: int, target_uid: int) -> tuple[bool,
         pass
     return False, False
 
-async def resolve_chat_owner(peer_id, chat_data: dict):
+async def resolve_chat_owner(peer_id: int, chat_data: dict):
     title = f"Беседа {peer_id}"
     vk_owner_id = None
 
@@ -329,43 +443,128 @@ def get_chat_inline_keyboard() -> str:
     kb.add(Text("📋 Роли"), color=KeyboardButtonColor.POSITIVE)
     kb.add(Text("📜 Правила"), color=KeyboardButtonColor.PRIMARY)
     kb.row()
+    kb.add(Text("🔑 Код пула"), color=KeyboardButtonColor.POSITIVE)
+    kb.add(Text("📦 Статус пула"), color=KeyboardButtonColor.PRIMARY)
+    kb.row()
     kb.add(Text("🛠 Модерация"), color=KeyboardButtonColor.NEGATIVE)
     kb.add(Text("📖 Команды"), color=KeyboardButtonColor.SECONDARY)
-    kb.row()
-    kb.add(Text("🌐 Ссылка"), color=KeyboardButtonColor.SECONDARY)
     return kb.get_json()
 
 
 # =====================================================================
-# 4. ЛИЧНЫЕ СООБЩЕНИЯ (ПАНЕЛЬ УПРАВЛЕНИЯ В ЛС)
+# 6. ЛИЧНЫЕ СООБЩЕНИЯ (ПАНЕЛЬ УПРАВЛЕНИЯ В ЛС + ГЕНЕРАТОР КОДОВ ПУЛА)
 # =====================================================================
+
+def get_private_keyboard(uid: int) -> str:
+    is_main = (uid == MAIN_OWNER_ID)
+    has_broadcast = (is_main or uid in db["broadcast_admins"])
+    kb = Keyboard(one_time=False, inline=False)
+    kb.add(Text("🌐 Ссылка проекта"), color=KeyboardButtonColor.POSITIVE)
+
+    if has_broadcast:
+        kb.row()
+        kb.add(Text("📢 Рассылка по чатам"), color=KeyboardButtonColor.NEGATIVE)
+        kb.add(Text("📜 Логи рассылок"), color=KeyboardButtonColor.PRIMARY)
+        kb.row()
+        kb.add(Text("➕ Админ рассылки"), color=KeyboardButtonColor.POSITIVE)
+        kb.add(Text("👥 Список рассылки"), color=KeyboardButtonColor.PRIMARY)
+
+    if is_main:
+        kb.row()
+        kb.add(Text("🔑 Код пула /г... (до 15)"), color=KeyboardButtonColor.POSITIVE)
+        kb.add(Text("🎭 Код: Ники и роли"), color=KeyboardButtonColor.POSITIVE)
+        kb.row()
+        kb.add(Text("⭐ Полный код (Оба пула)"), color=KeyboardButtonColor.PRIMARY)
+        kb.add(Text("📦 Все коды пулов"), color=KeyboardButtonColor.SECONDARY)
+        kb.row()
+        kb.add(Text("🗑 Удалить код пула"), color=KeyboardButtonColor.NEGATIVE)
+
+    return kb.get_json()
 
 @bot.on.private_message(text=["/start", "Начать", "начать", "Меню", "меню", "🔙 Главное меню", "❌ Отмена"])
 async def private_start(message: Message):
     uid = message.from_id
-    if uid in user_states:
-        del user_states[uid]
-    is_main = (uid == MAIN_OWNER_ID)
-    has_broadcast = (is_main or uid in db["broadcast_admins"])
-
-    kb = Keyboard(one_time=False, inline=False)
-    kb.add(Text("🌐 Ссылка проекта"), color=KeyboardButtonColor.POSITIVE)
-    if has_broadcast:
-        kb.row()
-        kb.add(Text("➕ Выдать доступ к рассылке"), color=KeyboardButtonColor.POSITIVE)
-        kb.add(Text("📜 Логи рассылок"), color=KeyboardButtonColor.PRIMARY)
-        kb.row()
-        kb.add(Text("👥 Список админов рассылки"), color=KeyboardButtonColor.PRIMARY)
-        kb.add(Text("📢 Начать рассылку по чатам"), color=KeyboardButtonColor.NEGATIVE)
-
+    user_states.pop(uid, None)
     await message.answer(
-        f"👑 **{DEFAULT_PROJECT_NAME} — ПАНЕЛЬ УПРАВЛЕНИЯ** 👑\n\n"
-        "Добро пожаловать в центр управления беседами.\n"
-        "Бот полностью автономен в каждом чате: владелец беседы получает `100 lvl`.",
-        keyboard=kb.get_json()
+        f"👑 **{DEFAULT_PROJECT_NAME} — ПАНЕЛЬ ВЛАДЕЛЬЦА БОТА** 👑\n\n"
+        f"• Лимит на 1 код активации: **до {MAX_CHATS_PER_CODE} бесед**.\n"
+        "• Пул `/г...` и `/g...` команд управляется отдельными ключами.\n"
+        "• Пул «Ники и роли» управляется отдельным пакетом/ключом.",
+        keyboard=get_private_keyboard(uid)
     )
 
-@bot.on.private_message(text="➕ Выдать доступ к рассылке")
+@bot.on.private_message(text="🔑 Код пула /г... (до 15)")
+async def private_gen_global_code(message: Message):
+    uid = message.from_id
+    if uid != MAIN_OWNER_ID:
+        return
+    user_states[uid] = "wait_code_global"
+    await message.answer(
+        f"🔑 **Создание кода для пула `/г...` и `/g...` команд** (макс. `{MAX_CHATS_PER_CODE}` чатов).\n\n"
+        "Введите через пробел: `[СВОЙ_КОД] [ЛИМИТ_ЧАТОВ_1_ДО_15]`\n"
+        "Или отправьте `авто` — сгенерирую случайный код на 15 чатов.",
+        keyboard=Keyboard(one_time=False, inline=True).add(Text("❌ Отмена"), color=KeyboardButtonColor.NEGATIVE).get_json()
+    )
+
+@bot.on.private_message(text="🎭 Код: Ники и роли")
+async def private_gen_nr_code(message: Message):
+    uid = message.from_id
+    if uid != MAIN_OWNER_ID:
+        return
+    user_states[uid] = "wait_code_nick_roles"
+    await message.answer(
+        f"🎭 **Создание кода для отдельного пула «Ники и роли»** (макс. `{MAX_CHATS_PER_CODE}` чатов).\n\n"
+        "Введите через пробел: `[СВОЙ_КОД] [ЛИМИТ_ЧАТОВ_1_ДО_15]`\n"
+        "Или отправьте `авто` — сгенерирую случайный код на 15 чатов.",
+        keyboard=Keyboard(one_time=False, inline=True).add(Text("❌ Отмена"), color=KeyboardButtonColor.NEGATIVE).get_json()
+    )
+
+@bot.on.private_message(text="⭐ Полный код (Оба пула)")
+async def private_gen_full_code(message: Message):
+    uid = message.from_id
+    if uid != MAIN_OWNER_ID:
+        return
+    user_states[uid] = "wait_code_all"
+    await message.answer(
+        f"⭐ **Создание полного кода (Пул `/г...` + Пул «Ники и роли»)** (макс. `{MAX_CHATS_PER_CODE}` чатов).\n\n"
+        "Введите через пробел: `[СВОЙ_КОД] [ЛИМИТ_ЧАТОВ_1_ДО_15]`\n"
+        "Или отправьте `авто` — сгенерирую случайный код на 15 чатов.",
+        keyboard=Keyboard(one_time=False, inline=True).add(Text("❌ Отмена"), color=KeyboardButtonColor.NEGATIVE).get_json()
+    )
+
+@bot.on.private_message(text="📦 Все коды пулов")
+async def private_list_codes(message: Message):
+    uid = message.from_id
+    if uid != MAIN_OWNER_ID:
+        return
+    codes = db.get("pool_codes", {})
+    if not codes:
+        return await message.answer("📦 Активных кодов пулов пока нет.")
+    lines = []
+    type_labels = {
+        "global": "🌐 Пул /г... и /g...",
+        "nick_roles": "🎭 Ники и роли",
+        "all": "⭐ Оба пула (Полный)"
+    }
+    for code, info in codes.items():
+        used = len(info.get("chats", []))
+        mx = info.get("max_chats", MAX_CHATS_PER_CODE)
+        t_lbl = type_labels.get(info.get("type", "global"), info.get("type"))
+        lines.append(f"• `{code}` | {t_lbl} | Чатов: `{used}/{mx}`")
+    await message.answer("📦 **СПИСОК КОДОВ АКТИВАЦИИ:**\n\n" + "\n".join(lines))
+
+@bot.on.private_message(text="🗑 Удалить код пула")
+async def private_del_code_start(message: Message):
+    uid = message.from_id
+    if uid != MAIN_OWNER_ID:
+        return
+    user_states[uid] = "wait_del_code"
+    await message.answer(
+        "🗑 Введите код пула, который нужно удалить (он сразу отключится во всех привязанных беседах):",
+        keyboard=Keyboard(one_time=False, inline=True).add(Text("❌ Отмена"), color=KeyboardButtonColor.NEGATIVE).get_json()
+    )
+
+@bot.on.private_message(text=["➕ Админ рассылки", "➕ Выдать доступ к рассылке"])
 async def private_add_adm(message: Message):
     uid = message.from_id
     if uid != MAIN_OWNER_ID and uid not in db["broadcast_admins"]:
@@ -385,7 +584,7 @@ async def private_view_logs(message: Message):
     recent = "\n".join(broadcast_logs[-10:]) if broadcast_logs else "📋 Логов рассылок пока нет."
     await message.answer(f"📜 **ИСТОРИЯ ОФИЦИАЛЬНЫХ РАССЫЛОК:**\n\n{recent}")
 
-@bot.on.private_message(text="👥 Список админов рассылки")
+@bot.on.private_message(text=["👥 Список рассылки", "👥 Список админов рассылки"])
 async def private_view_admins(message: Message):
     uid = message.from_id
     if uid != MAIN_OWNER_ID and uid not in db["broadcast_admins"]:
@@ -393,9 +592,9 @@ async def private_view_admins(message: Message):
     lines = []
     for aid in db["broadcast_admins"]:
         lines.append(f"• {await format_vk_user(aid)}")
-    await message.answer(f"👥 **ДОВЕРЕННЫЕ АДМИНЫ РАССЫЛКИ:**\n\n" + "\n".join(lines))
+    await message.answer("👥 **ДОВЕРЕННЫЕ АДМИНЫ РАССЫЛКИ:**\n\n" + "\n".join(lines))
 
-@bot.on.private_message(text="📢 Начать рассылку по чатам")
+@bot.on.private_message(text=["📢 Рассылка по чатам", "📢 Начать рассылку по чатам"])
 async def private_broadcast_start(message: Message):
     uid = message.from_id
     if uid != MAIN_OWNER_ID and uid not in db["broadcast_admins"]:
@@ -418,6 +617,47 @@ async def private_handler(message: Message):
         return
     state = user_states.get(uid)
 
+    if state in ("wait_code_global", "wait_code_nick_roles", "wait_code_all") and uid == MAIN_OWNER_ID:
+        del user_states[uid]
+        p_type = "global" if state == "wait_code_global" else ("nick_roles" if state == "wait_code_nick_roles" else "all")
+        parts = text.strip().split()
+        if parts[0].lower() in ("авто", "auto"):
+            custom_c = None
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else MAX_CHATS_PER_CODE
+        else:
+            custom_c = parts[0]
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else MAX_CHATS_PER_CODE
+
+        ok, res = create_pool_code(p_type, custom_c, limit, uid)
+        if not ok:
+            return await message.answer(res, keyboard=get_private_keyboard(uid))
+
+        actual_limit = db["pool_codes"][res]["max_chats"]
+        return await message.answer(
+            f"✅ **Код создан!**\n"
+            f"• Ключ: `{res}`\n"
+            f"• Лимит бесед: `0/{actual_limit}` (макс. {MAX_CHATS_PER_CODE})\n"
+            f"• Ввод в беседе: `/код {res}` или кнопка «🔑 Код пула»",
+            keyboard=get_private_keyboard(uid)
+        )
+
+    if state == "wait_del_code" and uid == MAIN_OWNER_ID:
+        del user_states[uid]
+        code = text.strip().upper()
+        code_obj = db.get("pool_codes", {}).pop(code, None)
+        if not code_obj:
+            return await message.answer(f"❌ Код `{code}` не найден.", keyboard=get_private_keyboard(uid))
+        for cid in code_obj.get("chats", []):
+            c_data = get_chat_data(int(cid))
+            if c_data["pools"].get("global_code") == code:
+                c_data["pools"]["global_cmds"] = False
+                c_data["pools"]["global_code"] = None
+            if c_data["pools"].get("nick_roles_code") == code:
+                c_data["pools"]["nick_roles"] = False
+                c_data["pools"]["nick_roles_code"] = None
+        save_db(db)
+        return await message.answer(f"🗑 Код `{code}` удалён, доступ в привязанных беседах отключён.", keyboard=get_private_keyboard(uid))
+
     if state == "wait_add_adm" and (uid == MAIN_OWNER_ID or uid in db["broadcast_admins"]):
         del user_states[uid]
         tid, _ = await resolve_target(message, [text.strip()])
@@ -427,9 +667,9 @@ async def private_handler(message: Message):
                 save_db(db)
                 u_fmt = await format_vk_user(tid)
                 add_log(f"Админ {await format_vk_user(uid)} выдал права рассылки для {u_fmt}")
-                return await message.answer(f"✅ Успешно! {u_fmt} добавлен в список рассыльщиков.")
-            return await message.answer("ℹ️ Этот пользователь уже в списке.")
-        return await message.answer("❌ Ошибка: укажите корректный VK ID или @ник.")
+                return await message.answer(f"✅ Успешно! {u_fmt} добавлен в список рассыльщиков.", keyboard=get_private_keyboard(uid))
+            return await message.answer("ℹ️ Этот пользователь уже в списке.", keyboard=get_private_keyboard(uid))
+        return await message.answer("❌ Ошибка: укажите корректный VK ID или @ник.", keyboard=get_private_keyboard(uid))
 
     if state == "wait_broadcast" and (uid == MAIN_OWNER_ID or uid in db["broadcast_admins"]):
         del user_states[uid]
@@ -451,15 +691,16 @@ async def private_handler(message: Message):
                 pass
 
         add_log(f"Массовая рассылка выполнена {await format_vk_user(uid)}. Охвачено чатов: {count}")
-        return await message.answer(f"🚀 **Рассылка успешно завершена!**\n• Доставлено в беседы: `{count}`")
+        return await message.answer(f"🚀 **Рассылка успешно завершена!**\n• Доставлено в беседы: `{count}`", keyboard=get_private_keyboard(uid))
 
     await message.answer(
-        "👋 Бот готов к работе в любой беседе! Добавь его в чат, выдай права администратора и используй `/menu` или `/help`."
+        "👋 Используй кнопки меню ниже для управления рассылками и кодами пулов.",
+        keyboard=get_private_keyboard(uid)
     )
 
 
 # =====================================================================
-# 5. РАБОТА В БЕСЕДАХ (МОДЕРАЦИЯ, КНОПКИ, ТИКЕТЫ И КОМАНДЫ)
+# 7. РАБОТА В БЕСЕДАХ (ПУЛЫ, МОДЕРАЦИЯ, НИКИ/РОЛИ, КНОПКИ И КОМАНДЫ)
 # =====================================================================
 
 @bot.on.chat_message()
@@ -540,8 +781,42 @@ async def chat_handler(message: Message):
                 raw_text = parts[1].strip()
                 clean_text = raw_text.lower()
 
+    # --- Быстрые кнопки беседы ---
     if clean_text in ["/menu", "/panel", "/панель", "меню", "панель"]:
         return await message.answer(f"👑 **ПАНЕЛЬ УПРАВЛЕНИЯ — {proj_name}**", keyboard=get_chat_inline_keyboard())
+
+    if clean_text in ["🔑 код пула", "код пула"]:
+        return await message.answer(
+            "🔑 **АКТИВАЦИЯ КОДА ПУЛА (до 15 чатов на 1 ключ)**\n\n"
+            "Введите команду: `/код [ВАШ_КЛЮЧ]` или `/активировать [ВАШ_КЛЮЧ]`\n"
+            "• Отдельный пул `/г...` и `/g...` открывает сетевые глобальные команды.\n"
+            "• Отдельный пул «Ники и роли» открывает кастомные ники и редактирование ролей.",
+            keyboard=get_chat_inline_keyboard()
+        )
+
+    if clean_text in ["📦 статус пула", "статус пула", "/пул", "/pool"]:
+        g_ok = has_global_pool(chat_data)
+        nr_ok = has_nick_roles_pool(chat_data)
+        g_code = chat_data["pools"].get("global_code")
+        nr_code = chat_data["pools"].get("nick_roles_code")
+
+        g_usage = ""
+        if g_code and g_code in db.get("pool_codes", {}):
+            c_info = db["pool_codes"][g_code]
+            g_usage = f" (`{g_code}` — `{len(c_info.get('chats', []))}/{c_info.get('max_chats', MAX_CHATS_PER_CODE)}` чатов)"
+
+        nr_usage = ""
+        if nr_code and nr_code in db.get("pool_codes", {}):
+            c_info = db["pool_codes"][nr_code]
+            nr_usage = f" (`{nr_code}` — `{len(c_info.get('chats', []))}/{c_info.get('max_chats', MAX_CHATS_PER_CODE)}` чатов)"
+
+        return await message.answer(
+            f"📦 **СТАТУС ПУЛОВ БЕСЕДЫ:**\n\n"
+            f"• Пул `/г...` и `/g...` команд: {'🟢 Активен' + g_usage if g_ok else '🔴 Не активирован'}\n"
+            f"• Отдельный пул «Ники и роли»: {'🟢 Активен' + nr_usage if nr_ok else '🔴 Не активирован'}\n\n"
+            "💡 Активировать ключ: `/код [КЛЮЧ]`",
+            keyboard=get_chat_inline_keyboard()
+        )
 
     if clean_text in ["🌐 ссылка", "🌐 сайт", "ссылка", "сайт", "/link", "/ссылка"]:
         return await message.answer(f"🌐 Ссылка проекта **{proj_name}**: {proj_url}", keyboard=get_chat_inline_keyboard())
@@ -554,9 +829,10 @@ async def chat_handler(message: Message):
             "🛠 **ШПАРГАЛКА МОДЕРАЦИИ И НАСТРОЕК**\n\n"
             "• `45+ lvl`: `/мут`, `/анмут`, `/варн`, `/варны`, `/анварн`, `/кик`, `/очистить`, `/закреп`, `/откреп`\n"
             "• `55+ lvl`: `/бан`, `/анбан`, `/банлист`, `/снятьвсеварны`\n"
-            "• `60+ lvl`: `/сник`, `/делник`, `/сетлидер`, `/снятлидера`, `/ответить`\n"
-            "• `70+ lvl`: `/сетадмин`, `/снятьроль`, `/сетправила`, `/сбросправил`, `/логи`, `/размутвсех`, `/антиспам`\n"
-            "• `90+ lvl`: `/новаяроль`, `/удалитьроль`, `/сбросролей`, `/сетназвание`, `/сетссылка`, `/сетвладелец`, `/сбросвладельца`, `/гбан`",
+            "• `60+ lvl`: `/сник`, `/делник` *(пул)*, `/сетлидер`, `/снятлидера`, `/ответить`\n"
+            "• `70+ lvl`: `/сетадмин`, `/снятьроль` *(пул)*, `/сетправила`, `/сбросправил`, `/логи`, `/размутвсех`, `/антиспам`\n"
+            "• `90+ lvl`: `/новаяроль`, `/удалитьроль`, `/сбросролей` *(пул)*, `/сетназвание`, `/сетссылка`, `/сетвладелец`, `/сбросвладельца`\n"
+            "• `Пул /г... и /g...`: `/гбан`, `/гунбан`, `/гроль`, `/снятьгроль`, `/гстата`, `/гчаты`",
             keyboard=get_chat_inline_keyboard()
         )
 
@@ -589,78 +865,104 @@ async def chat_handler(message: Message):
     cmd = args[0].lower() if args else ""
     params = args[1:] if len(args) > 1 else []
 
-    if cmd in ["help", "хелп"]:
+    # =================================================================
+    # ЖЁСТКАЯ ПРОВЕРКА ПУЛА ДЛЯ ВСЕХ КОМАНД НА /г... И /g...
+    # =================================================================
+    if cmd.startswith("г") or cmd.startswith("g"):
+        if not has_global_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer(
+                f"🔒 **Команда `/{cmd}` относится к сетевому пулу `/г...` и `/g...`!**\n"
+                f"Для этой беседы пул ещё не активирован (1 код = до `{MAX_CHATS_PER_CODE}` чатов).\n\n"
+                "👉 Активировать ключ: `/код [КЛЮЧ]` или кнопка **«🔑 Код пула»**.",
+                keyboard=get_chat_inline_keyboard()
+            )
+
+    # =================================================================
+    # КОМАНДЫ АКТИВАЦИИ И УПРАВЛЕНИЯ ПУЛАМИ В БЕСЕДЕ
+    # =================================================================
+    if cmd in ["код", "code", "активировать", "activate"]:
+        if not params:
+            return await message.answer("❌ Формат: `/код [ВАШ_КЛЮЧ_АКТИВАЦИИ]`")
+        ok, reply_msg = activate_pool_code_for_chat(peer_id, params[0])
+        return await message.answer(reply_msg, keyboard=get_chat_inline_keyboard())
+
+    elif cmd in ["создатькод", "genpool"]:
+        if uid_int != MAIN_OWNER_ID:
+            return await message.answer("❌ Создание кодов пула доступно только владельцу бота.")
+        p_type = params[0].lower() if params else "global"
+        if p_type not in ("global", "nick_roles", "all"):
+            return await message.answer("❌ Формат: `/создатькод [global|nick_roles|all] [КОД] [лимит_до_15]`")
+        c_code = params[1] if len(params) > 1 and not params[1].isdigit() else None
+        lim = int(params[-1]) if len(params) > 1 and params[-1].isdigit() else MAX_CHATS_PER_CODE
+        ok, res = create_pool_code(p_type, c_code, lim, uid_int)
+        if not ok:
+            return await message.answer(res)
+        return await message.answer(f"✅ Код `{res}` (`{p_type}`) создан на `{db['pool_codes'][res]['max_chats']}` чатов.")
+
+    elif cmd in ["пулники", "nickpool"]:
+        if uid_int != MAIN_OWNER_ID and user_lvl < 95:
+            return await message.answer("❌ Требуется владелец бота или 95+ lvl.")
+        chat_data["pools"]["nick_roles"] = not bool(chat_data["pools"].get("nick_roles"))
+        save_db(db)
+        st = "🟢 ВКЛЮЧЁН" if chat_data["pools"]["nick_roles"] else "🔴 ВЫКЛЮЧЕН"
+        return await message.answer(f"🎭 Отдельный пул «Ники и роли» в этой беседе: {st}.")
+
+    # =================================================================
+    # ОБЩИЕ КОМАНДЫ ЧАТА
+    # =================================================================
+    elif cmd in ["help", "хелп"]:
         help_msg = (
             f"📖 **СПИСОК КОМАНД — {proj_name}** 📖\n\n"
             "💡 *Цель можно указать через `@ник`, `id`, ссылку или ответом (реплаем).*\n\n"
-            "🌐 **Общий функционал:**\n"
+            "🌐 **Общий функционал (без пула):**\n"
             "• `/menu` (`/панель`) — интерактивные кнопки чата\n"
+            "• `/код [ключ]` (`/активировать`) — активировать пул (до 15 чатов на код)\n"
+            "• `/пул` (`/pool`) — проверить активные пулы беседы\n"
             "• `/stats` (`/стата`, `/профиль`) — досье участника\n"
             "• `/проверка` (`/check`) `[@ник/id/ответ]` — расширенное досье\n"
             "• `/admins` (`/админс`) — владелец (`100 lvl`) и админы чата\n"
             "• `/staff` (`/состав`) — полный состав чата и лидеры\n"
-            "• `/nlist` (`/нлист`) — список ников участников\n"
-            "• `/ник [текст]` — установить свой ник\n"
             "• `/roles` (`/роли`) — иерархия рангов\n"
             "• `/rules` (`/правила`) — правила беседы\n"
             "• `/leaders` (`/лидеры`) — список лидеров\n"
             "• `/info` (`/инфо`) — информация о беседе\n"
             "• `/репорт [текст]` (`/report`) — создать тикет/репорт\n"
             "• `/пинг` (`/ping`) и `/статус` (`/status`) — пинг и аптайм\n"
-            "• `/явладелец` — закрепить владельца (`100 lvl`), доступно только создателю/админу беседы со звездой\n\n"
+            "• `/явладелец` — закрепить владельца (`100 lvl`), только для создателя/админа беседы со звездой\n\n"
+            "🎭 **Отдельный пул «Ники и роли»:**\n"
+            "• `/ник [текст]`, `/нлист`, `/сник` (60+), `/делник` (60+)\n"
+            "• `/сетадмин` (70+), `/снятьроль` (70+), `/новаяроль` (90+), `/удалитьроль` (90+), `/сбросролей` (90+)\n\n"
+            "🌍 **Сетевой пул `/г...` и `/g...` (по коду до 15 чатов):**\n"
+            "• `/гбан` (`/gban`) `[@ник/id/ответ] [причина]` — глобальный бан (90+ lvl)\n"
+            "• `/гунбан` (`/gunban`) `[@ник/id]` — снять глобальный бан (90+ lvl)\n"
+            "• `/гроль` (`/grole`) `[@ник/id] [ур]` — глобальная роль (95+ lvl)\n"
+            "• `/снятьгроль` (`/grr`) `[@ник/id]` — снять глобальную роль (95+ lvl)\n"
+            "• `/гстата` (`/gstats`) — глобальная статистика сети (60+ lvl)\n\n"
         )
         if user_lvl >= 45:
             help_msg += (
                 "🛡 **Модерация чата (45+ lvl):**\n"
-                "• `/мут` (`/mute`) `[@ник/id/ответ] [минуты]` — выдать мут\n"
-                "• `/анмут` (`/unmute`) `[@ник/id/ответ]` — снять мут\n"
-                "• `/кик` (`/kick`) `[@ник/id/ответ]` — исключить из чата\n"
-                "• `/варн` (`/warn`) `[@ник/id/ответ] [причина]` — выдать варн (3 = кик)\n"
-                "• `/варны` (`/warns`) `[@ник/id/ответ]` — список варнов игрока\n"
-                "• `/анварн` (`/unwarn`) `[@ник/id/ответ]` — снять последний варн\n"
-                "• `/закреп` (`/pin`) — закрепить сообщение (в ответ на него)\n"
-                "• `/откреп` (`/unpin`) — открепить сообщение\n"
-                "• `/очистить` (`/clear`) `[кол-во]` — удалить последние сообщения\n\n"
+                "• `/мут` `[@ник/id/ответ] [мин]`, `/анмут`, `/кик`, `/варн`, `/варны`, `/анварн`, `/закреп`, `/откреп`, `/очистить [кол-во]`\n\n"
             )
         if user_lvl >= 55:
             help_msg += (
                 "🚨 **Старшая модерация (55+ lvl):**\n"
-                "• `/бан` (`/ban`) `[@ник/id/ответ] [причина]` — заблокировать в чате\n"
-                "• `/анбан` (`/unban`) `[@ник/id]` — разблокировать в чате\n"
-                "• `/банлист` (`/banlist`) — чёрный список беседы\n"
-                "• `/снятьвсеварны` (`/clearwarns`) `[@ник/id/ответ]` — обнулить варны\n\n"
+                "• `/бан` `[@ник/id/ответ] [причина]`, `/анбан`, `/банлист`, `/снятьвсеварны`\n\n"
             )
         if user_lvl >= 60:
             help_msg += (
                 "👑 **Руководство (60+ lvl):**\n"
-                "• `/сник` (`/snick`, `/setnick`) `[@ник/id/ответ] [Ник]` — выдать ник\n"
-                "• `/делник` (`/delnick`) `[@ник/id/ответ]` — удалить ник\n"
-                "• `/сетлидер` (`/setleader`) `[@ник/id/ответ] [Организация]` — поставить лидера\n"
-                "• `/снятлидера` (`/removeleader`) `[@ник/id/ответ]` — снять лидера\n"
-                "• `/репорты` (`/reports`) и `/ответить` `[#id] [ответ]` — работа с репортами\n\n"
+                "• `/сетлидер` `[@ник/id/ответ] [Орг]`, `/снятлидера`, `/репорты`, `/ответить [#id] [ответ]`\n\n"
             )
         if user_lvl >= 70:
             help_msg += (
-                "⚡ **Администрация и кастомизация (70+ lvl):**\n"
-                "• `/сетадмин` (`/setadmin`, `/выдатьроль`, `/роль`) `[@ник/id/ответ] [ур]` — выдать уровень\n"
-                "• `/снятьроль` (`/removerole`) `[@ник/id/ответ]` — снять уровень (0 lvl)\n"
-                "• `/сетправила` (`/setrules`) `[новый текст]` — изменить правила беседы\n"
-                "• `/сбросправил` (`/resetrules`) — вернуть стандартные правила\n"
-                "• `/размутвсех` (`/unmuteall`) — снять все муты в чате\n"
-                "• `/антиспам` (`/antispam`) — вкл/выкл авто-удаление ссылок\n"
-                "• `/логи` (`/logs`) — системные логи\n\n"
+                "⚡ **Настройка чата (70+ lvl):**\n"
+                "• `/сетправила [текст]`, `/сбросправил`, `/размутвсех`, `/антиспам`, `/логи`\n\n"
             )
         if user_lvl >= 90:
             help_msg += (
-                "🔥 **Высший состав и настройка под проект (90+ lvl):**\n"
-                "• `/новаяроль` (`/newrole`) `[ур] [Название]` — создать/изменить роль\n"
-                "• `/удалитьроль` (`/delrole`) `[ур]` — удалить роль\n"
-                "• `/сбросролей` (`/resetroles`) — вернуть стандартные роли\n"
-                "• `/сетназвание` (`/setproject`) `[Название]` — задать название проекта для чата\n"
-                "• `/сетссылка` (`/seturl`) `[URL]` — задать ссылку кнопки для чата\n"
-                "• `/сетвладелец` (`/setowner`) `[@ник/id/ответ]` — закрепить владельца чата\n"
-                "• `/сбросвладельца` (`/resetowner`) — сбросить владельца чата\n"
-                "• `/гбан` (`/gban`) `[@ник/id/ответ] [причина]` — глобальный бан\n"
+                "🔥 **Высший состав (90+ lvl):**\n"
+                "• `/сетназвание [Название]`, `/сетссылка [URL]`, `/сетвладелец`, `/сбросвладельца`\n"
             )
         return await message.answer(help_msg, keyboard=get_chat_inline_keyboard())
 
@@ -686,7 +988,7 @@ async def chat_handler(message: Message):
         if old_owner and str(old_owner) in chat_data["members"]:
             del chat_data["members"][str(old_owner)]
         save_db(db)
-        return await message.answer("♻️ Владелец беседы сброшен. Новый владелец может прописать `/явладелец` или быть назначен через `/сетвладелец`.")
+        return await message.answer("♻️ Владелец беседы сброшен.")
 
     elif cmd in ["setrules", "сетправила"]:
         if user_lvl < 70:
@@ -696,7 +998,7 @@ async def chat_handler(message: Message):
             return await message.answer("❌ Формат: `/сетправила [новый текст правил беседы]`")
         chat_data["rules_text"] = new_rules
         save_db(db)
-        return await message.answer("✅ Новые правила беседы сохранены! Проверить: `/правила` или кнопка «📜 Правила».")
+        return await message.answer("✅ Новые правила беседы сохранены!")
 
     elif cmd in ["resetrules", "сбросправил"]:
         if user_lvl < 70:
@@ -745,8 +1047,8 @@ async def chat_handler(message: Message):
             f"⚡ **СТАТУС ЯДРА {proj_name}**\n\n"
             f"• Аптайм сервера: `{hours}ч {minutes}м {seconds}с`\n"
             f"• Подключено чатов: `{chats_count}`\n"
-            f"• Репортов в базе: `{len(db.get('reports', []))}`\n"
-            f"• Сборка: `Universal White-Label Edition`"
+            f"• Пул `/г...` и `/g...`: `{'Активен 🟢' if has_global_pool(chat_data) else 'Не активен 🔴'}`\n"
+            f"• Пул «Ники и роли»: `{'Активен 🟢' if has_nick_roles_pool(chat_data) else 'Не активен 🔴'}`"
         )
 
     elif cmd in ["info", "инфо"]:
@@ -759,8 +1061,7 @@ async def chat_handler(message: Message):
             f"• Peer ID: `{peer_id}`\n"
             f"• Владелец: {owner_fmt}\n"
             f"• Антиспам ссылок: {antispam_str}\n"
-            f"• Ваш уровень: `{user_lvl} lvl` ({get_role_title(user_lvl, chat_data, is_chat_owner(uid_int, chat_data, owner_id))})\n"
-            f"• Участников в базе чата: `{len(chat_data.get('members', {}))}`"
+            f"• Ваш уровень: `{user_lvl} lvl` ({get_role_title(user_lvl, chat_data, is_chat_owner(uid_int, chat_data, owner_id))})"
         )
 
     elif cmd in ["report", "репорт"]:
@@ -847,7 +1148,12 @@ async def chat_handler(message: Message):
             f"• *Ответ:* **{ans_text}**"
         )
 
+    # =================================================================
+    # ОТДЕЛЬНЫЙ ПУЛ «НИКИ И РОЛИ»
+    # =================================================================
     elif cmd in ["ник", "nick"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Команда `/ник` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
         if not params:
             return await message.answer("❌ Формат: `/ник [Ваш никнейм]`")
         new_nick = " ".join(params).strip()
@@ -863,6 +1169,8 @@ async def chat_handler(message: Message):
         return await message.answer(f"✅ Ваш ник в беседе обновлён на: **{new_nick}**")
 
     elif cmd in ["nlist", "нлист"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Список ников `/нлист` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
         members = chat_data.get("members", {})
         nlist_lines = []
         for m_id, info in members.items():
@@ -875,6 +1183,8 @@ async def chat_handler(message: Message):
         return await message.answer("📋 **АКТИВНЫЕ КАСТОМНЫЕ НИКНЕЙМЫ:**\n\n" + "\n".join(nlist_lines))
 
     elif cmd in ["snick", "сник", "setnick", "сетник"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Выдача ников `/сник` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
         if user_lvl < 60:
             return await message.answer(f"❌ Недостаточно прав! Требуется 60+ уровень (у вас: {user_lvl}).")
         orig_parts = raw_text.split()[1:]
@@ -883,7 +1193,7 @@ async def chat_handler(message: Message):
 
         target_id, remaining = await resolve_target(message, orig_parts)
         if not target_id:
-            return await message.answer("❌ Пользователь не найден. Укажите `@ник`, `id` или сделайте реплай.")
+            return await message.answer("❌ Пользователь не найден.")
 
         new_nick = " ".join(orig_parts).strip() if message.reply_message else " ".join(remaining).strip()
         if not new_nick:
@@ -901,6 +1211,8 @@ async def chat_handler(message: Message):
         return await message.answer(f"✅ Ник **{new_nick}** выдан {await format_vk_user(target_id)}.")
 
     elif cmd in ["delnick", "делник"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Удаление ников `/делник` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
         if user_lvl < 60:
             return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
@@ -913,6 +1225,87 @@ async def chat_handler(message: Message):
             return await message.answer(f"🟢 Ник удалён у {await format_vk_user(tid)}.")
         return await message.answer("❌ Никнейм не найден в базе.")
 
+    elif cmd in ["newrole", "новаяроль"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Создание ролей `/новаяроль` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
+        if user_lvl < 90:
+            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
+        if len(params) < 2 or not params[0].isdigit():
+            return await message.answer("❌ Формат: `/новаяроль [ур] [Название]`")
+        lvl_key = str(int(params[0]))
+        r_name = " ".join(params[1:])
+        chat_data["role_names"][lvl_key] = r_name
+        save_db(db)
+        return await message.answer(f"✅ Роль для уровня `{lvl_key} lvl` установлена: **{r_name}**")
+
+    elif cmd in ["delrole", "удалитьроль"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Удаление ролей `/удалитьроль` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
+        if user_lvl < 90:
+            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
+        if not params or not params[0].isdigit():
+            return await message.answer("❌ Укажите числовой уровень роли, например: `/удалитьроль 75`")
+        lvl_key = str(int(params[0]))
+        if lvl_key in chat_data["role_names"]:
+            del chat_data["role_names"][lvl_key]
+            save_db(db)
+            return await message.answer(f"🗑 Роль уровня `{lvl_key}` удалена из списка беседы.")
+        return await message.answer("❌ Указанная роль не найдена.")
+
+    elif cmd in ["resetroles", "сбросролей"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Сброс ролей `/сбросролей` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
+        if user_lvl < 90:
+            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
+        chat_data["role_names"] = {str(k): v for k, v in DEFAULT_ROLES.items()}
+        save_db(db)
+        return await message.answer("♻️ Список ролей беседы сброшен к стандартному.")
+
+    elif cmd in ["setadmin", "сетадмин", "выдатьадм", "выдатьроль", "роль"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Выдача ролей `/сетадмин` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
+        if user_lvl < 70:
+            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
+        tid, rem = await resolve_target(message, params)
+        if not tid:
+            return await message.answer("❌ Формат: `/сетадмин [@ник/id/ответ] [уровень]`")
+        lvl_val = None
+        for p in rem:
+            if p.isdigit():
+                lvl_val = int(p)
+                break
+        if lvl_val is None:
+            return await message.answer("❌ Укажите числовой уровень админки, например: `/сетадмин @id1 70`")
+
+        t_str = str(tid)
+        current_data = chat_data["members"].get(t_str, {"nickname": ""})
+        current_nick = current_data.get("nickname", "") if isinstance(current_data, dict) else ""
+
+        chat_data["members"][t_str] = {"level": lvl_val, "nickname": current_nick}
+        save_db(db)
+        add_log(f"Выдача роли {lvl_val} lvl для {await format_vk_user(tid)} от {await format_vk_user(uid_int)}")
+        return await message.answer(f"✅ {await format_vk_user(tid)} присвоен ранг `{lvl_val} lvl` (**{get_role_title(lvl_val, chat_data)}**).")
+
+    elif cmd in ["removerole", "снятьроль", "снятадм"]:
+        if not has_nick_roles_pool(chat_data) and uid_int != MAIN_OWNER_ID:
+            return await message.answer("🔒 Снятие ролей `/снятьроль` входит в отдельный пул **«Ники и роли»**. Активируйте ключ через `/код [КЛЮЧ]`.")
+        if user_lvl < 70:
+            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
+        tid, _ = await resolve_target(message, params)
+        if not tid:
+            return await message.answer("❌ Укажите пользователя.")
+
+        t_str = str(tid)
+        current_data = chat_data["members"].get(t_str, {"nickname": ""})
+        current_nick = current_data.get("nickname", "") if isinstance(current_data, dict) else ""
+
+        chat_data["members"][t_str] = {"level": 0, "nickname": current_nick}
+        save_db(db)
+        return await message.answer(f"🟢 С {await format_vk_user(tid)} сняты права админки (0 lvl).")
+
+    # =================================================================
+    # МОДЕРАЦИЯ И СТАТИСТИКА БЕЗ ПУЛА
+    # =================================================================
     elif cmd in ["stats", "стата", "профиль"]:
         target_id, _ = await resolve_target(message, params)
         if not target_id:
@@ -1171,74 +1564,6 @@ async def chat_handler(message: Message):
         save_db(db)
         return await message.answer(f"👑 Владельцем чата закреплён {await format_vk_user(tid)} (`100 lvl`).")
 
-    elif cmd in ["newrole", "новаяроль"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
-        if len(params) < 2 or not params[0].isdigit():
-            return await message.answer("❌ Формат: `/новаяроль [ур] [Название]`")
-        lvl_key = str(int(params[0]))
-        r_name = " ".join(params[1:])
-        chat_data["role_names"][lvl_key] = r_name
-        save_db(db)
-        return await message.answer(f"✅ Роль для уровня `{lvl_key} lvl` установлена: **{r_name}**")
-
-    elif cmd in ["delrole", "удалитьроль"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
-        if not params or not params[0].isdigit():
-            return await message.answer("❌ Укажите числовой уровень роли, например: `/удалитьроль 75`")
-        lvl_key = str(int(params[0]))
-        if lvl_key in chat_data["role_names"]:
-            del chat_data["role_names"][lvl_key]
-            save_db(db)
-            return await message.answer(f"🗑 Роль уровня `{lvl_key}` удалена из списка беседы.")
-        return await message.answer("❌ Указанная роль не найдена.")
-
-    elif cmd in ["resetroles", "сбросролей"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
-        chat_data["role_names"] = {str(k): v for k, v in DEFAULT_ROLES.items()}
-        save_db(db)
-        return await message.answer("♻️ Список ролей беседы сброшен к стандартному.")
-
-    elif cmd in ["setadmin", "сетадмин", "выдатьадм", "выдатьроль", "роль"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
-        tid, rem = await resolve_target(message, params)
-        if not tid:
-            return await message.answer("❌ Формат: `/сетадмин [@ник/id/ответ] [уровень]`")
-        lvl_val = None
-        for p in rem:
-            if p.isdigit():
-                lvl_val = int(p)
-                break
-        if lvl_val is None:
-            return await message.answer("❌ Укажите числовой уровень админки, например: `/сетадмин @evgenn09 70`")
-
-        t_str = str(tid)
-        current_data = chat_data["members"].get(t_str, {"nickname": ""})
-        current_nick = current_data.get("nickname", "") if isinstance(current_data, dict) else ""
-
-        chat_data["members"][t_str] = {"level": lvl_val, "nickname": current_nick}
-        save_db(db)
-        add_log(f"Выдача роли {lvl_val} lvl для {await format_vk_user(tid)} от {await format_vk_user(uid_int)}")
-        return await message.answer(f"✅ {await format_vk_user(tid)} присвоен ранг `{lvl_val} lvl` (**{get_role_title(lvl_val, chat_data)}**).")
-
-    elif cmd in ["removerole", "снятьроль", "снятадм"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
-        tid, _ = await resolve_target(message, params)
-        if not tid:
-            return await message.answer("❌ Укажите пользователя.")
-
-        t_str = str(tid)
-        current_data = chat_data["members"].get(t_str, {"nickname": ""})
-        current_nick = current_data.get("nickname", "") if isinstance(current_data, dict) else ""
-
-        chat_data["members"][t_str] = {"level": 0, "nickname": current_nick}
-        save_db(db)
-        return await message.answer(f"🟢 С {await format_vk_user(tid)} сняты права админки (0 lvl).")
-
     elif cmd in ["setleader", "сетлидер", "поставитьлидера"]:
         if user_lvl < 60:
             return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
@@ -1266,6 +1591,9 @@ async def chat_handler(message: Message):
         lines = [f"• {await format_vk_user(int(l_id))} ➔ **{org}**" for l_id, org in db["leaders"].items()]
         return await message.answer("👔 **ЛИДЕРЫ ОРГАНИЗАЦИЙ:**\n\n" + "\n".join(lines))
 
+    # =================================================================
+    # СЕТЕВЫЕ КОМАНДЫ НА /г... И /g... (ТОЛЬКО ПО ПУЛУ ДО 15 ЧАТОВ)
+    # =================================================================
     elif cmd in ["grole", "гроль"]:
         if user_lvl < 95:
             return await message.answer(f"❌ Требуется 95+ уровень (у вас: {user_lvl}).")
@@ -1286,7 +1614,7 @@ async def chat_handler(message: Message):
             return await message.answer(f"🟢 Глобальная роль снята у {await format_vk_user(tid)}.")
         return await message.answer("❌ У игрока нет глобальных ролей.")
 
-    elif cmd in ["gban", "гбан"]:
+    elif cmd in ["gban", "гбан", "гбн"]:
         if user_lvl < 90:
             return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
@@ -1297,6 +1625,27 @@ async def chat_handler(message: Message):
         save_db(db)
         add_log(f"Глобальный бан: {await format_vk_user(tid)}, причина: {reason}")
         return await message.answer(f"⛔ ГЛОБАЛЬНЫЙ БАН для {await format_vk_user(tid)}! Причина: {reason}")
+
+    elif cmd in ["gunban", "гунбан", "гразбан"]:
+        if user_lvl < 90:
+            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
+        tid, _ = await resolve_target(message, params)
+        if tid and str(tid) in db["global_bans"]:
+            del db["global_bans"][str(tid)]
+            save_db(db)
+            return await message.answer(f"🟢 {await format_vk_user(tid)} убран из глобального бана.")
+        return await message.answer("❌ Пользователя нет в глобальном бане.")
+
+    elif cmd in ["gstats", "гстата", "gchats", "гчаты"]:
+        if user_lvl < 60:
+            return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
+        return await message.answer(
+            f"🌍 **СЕТЕВАЯ СТАТИСТИКА ПУЛА:**\n\n"
+            f"• Всего бесед бота: `{len(db.get('global_chats', []))}`\n"
+            f"• Глобальных ролей: `{len(db.get('global_roles', {}))}`\n"
+            f"• Глобальных банов: `{len(db.get('global_bans', {}))}`\n"
+            f"• Лидеров в сети: `{len(db.get('leaders', {}))}`"
+        )
 
     elif cmd in ["admins", "админс"]:
         lines = []
@@ -1356,7 +1705,7 @@ async def chat_handler(message: Message):
 
 
 # =====================================================================
-# 6. ЗАПУСК БОТА
+# 8. ЗАПУСК БОТА
 # =====================================================================
 if __name__ == "__main__":
     bot.run_forever()
