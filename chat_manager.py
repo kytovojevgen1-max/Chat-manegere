@@ -11,7 +11,7 @@ from vkbottle import Keyboard, KeyboardButtonColor, Text
 # =====================================================================
 # 1. НАСТРОЙКИ СБОРКИ (МЕНЯЮТСЯ В ОДНОМ МЕСТЕ ПОД ЛЮБОЙ ПРОЕКТ)
 # =====================================================================
-TOKEN = "vk1.a.qGTN_rCK6d4Yg4ty8YkruE6DbovbX5lwzHcQcN6wQ15aACfSrhsyi5F7R9xip5mq03EeLvxI2gZwJSVvuWMv0eP7vv59FFJvPNYWpRI7R2nzXM0gbobnLpmRaI3yM751Cml4ZOPDcIc380c3hekN0jgZ3QeP76p9hn1Sw6kwK6mOCyomwB33nVy1uBGAbC0mDQpu5eiq2HlVDAKi4YjHYw"
+TOKEN = "vk1.a.5BfnzsvcbvRGCC9ZGxmbKdzOU-0NBWIPc9RovnKuIImAHcV46i4wMJUGvrkua3xKhDqo57KVoiXQOqhuctwA93--pk54OWAy_rfzgGfTTQFdG1vFzRObXKPTikSt3h1rRR6ImqGbPMaOgAC3vLaPxx359f9T4N2nl2d4dZGFInNv4F9LLsctf3GiuJfrBkqBcji79CiXrPLqeClPoXaptg"
 MAIN_OWNER_ID = 897082738  # Главный VK ID владельца бота (ЛС-панель, генерация кодов, рассылка)
 
 DEFAULT_PROJECT_NAME = "CHAT MANAGER"
