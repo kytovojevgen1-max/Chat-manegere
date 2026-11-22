@@ -4,7 +4,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from aiohttp import web
 from vkbottle import CtxStorage, Keyboard, KeyboardButtonColor, Text
@@ -15,9 +15,13 @@ from vkbottle.bot import Bot, Message
 # ==============================================================================
 TOKEN = os.getenv(
     "VK_TOKEN",
-    "vk1.a.5BfnzsvcbvRGCC9ZGxmbKdzOU-0NBWIPc9RovnKuIImAHcV46i4wMJUGvrkua3xKhDqo57KVoiXQOqhuctwA93--pk54OWAy_rfzgGfTTQFdG1vFzRObXKPTikSt3h1rRR6ImqGbPMaOgAC3vLaPxx359f9T4N2nl2d4dZGFInNv4F9LLsctf3GiuJfrBkqBcji79CiXrPLqeClPoXaptg"
+    "vk1.a.ONWFvnPZaVTXfIN1NsuwhyGfU6LsNurMI8qT_pVrqm_pxrdIBRvh_ibzoBVUmX5DhOTv26MSpMPmeKEwCZvtIbjfCByslMQ7_-K7o8ipviBYTbslgWeMHoDeWZ5HXtBVPNNCGfkXdK0DsjOe71hXQBXPvfI6K1h3S4YfrPAd6k6I1u8v4Nmp5tZSmZkgISWrhX7WtIcbWkteWFeFXrUd-g",
 )
-OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "897082738").split(",") if x.strip().isdigit()}
+OWNER_IDS = {
+    int(x)
+    for x in os.getenv("OWNER_IDS", "897082738").split(",")
+    if x.strip().isdigit()
+}
 DB_FILE = os.getenv("DB_FILE", "games_chat_manager_db.json")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -28,13 +32,13 @@ ctx = CtxStorage()
 # БАЗА ДАННЫХ (АТОМАРНОЕ СОХРАНЕНИЕ)
 # ==============================================================================
 DEFAULT_DB: Dict[str, Any] = {
-    "chats": {},          # peer_id -> settings, ranks, cmd_ranks, warns, admin_warns, mutes, bans, rep, notes, leaders, nicks, marriage, welcome
+    "chats": {},          # peer_id -> settings, ranks, cmd_ranks, warns, admin_warns, mutes, bans, rep, notes, leaders, nicks, marriages, welcome
     "global_admins": {},  # user_id -> rank (0..100)
     "reports": [],        # list of dicts
     "economy": {},        # user_id -> {balance, bank, last_bonus, last_work, businesses, last_collect}
 }
 
-# Стандартные минимальные ранги для команд (можно менять отдельно для каждой беседы через /доступ)
+# Стандартные минимальные ранги для команд (настраиваются отдельно для каждой беседы через /доступ)
 DEFAULT_CMD_RANKS: Dict[str, int] = {
     "ник": 0,          # сменить свой ник
     "сник": 15,        # сменить ник другому игроку
@@ -222,7 +226,6 @@ async def chat_guard(msg: Message):
     user_id = msg.from_id
     chat = get_chat(peer_id)
 
-    # Системное событие входа нового участника
     if msg.action and msg.action.type.value in ("chat_invite_user", "chat_invite_user_by_link"):
         invited_id = msg.action.member_id or user_id
         if str(invited_id) in chat.get("bans", {}):
@@ -249,7 +252,6 @@ async def chat_guard(msg: Message):
     rank = get_rank(peer_id, user_id)
     now = time.time()
 
-    # Проверка мута
     mute_until = float(chat["mutes"].get(str(user_id), 0))
     if mute_until > now and rank < 30:
         try:
@@ -261,7 +263,6 @@ async def chat_guard(msg: Message):
         chat["mutes"].pop(str(user_id), None)
         save_db(db)
 
-    # Лок чата
     if chat.get("locked") and rank < 50:
         try:
             await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
@@ -273,7 +274,6 @@ async def chat_guard(msg: Message):
     if not text or rank >= 30:
         return
 
-    # Антиреклама
     if chat.get("antilink") and re.search(r"(https?://|t\.me/|vk\.me/|vk\.cc/|discord\.gg/)", text, re.I):
         try:
             await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
@@ -282,7 +282,6 @@ async def chat_guard(msg: Message):
             pass
         return
 
-    # Антикапс
     letters = [c for c in text if c.isalpha()]
     if chat.get("anticaps") and len(letters) >= 8:
         upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
@@ -294,7 +293,6 @@ async def chat_guard(msg: Message):
                 pass
             return
 
-    # Антифлуд / Антиспам
     key = (peer_id, user_id)
     if chat.get("antiflood") and now - _last_msg_time.get(key, 0) < 1.2:
         try:
@@ -314,7 +312,7 @@ async def chat_guard(msg: Message):
 
 
 # ==============================================================================
-# ПОМОЩЬ И ПАНЕЛЬ
+# ПОМОЩЬ, ПАНЕЛЬ И СТАРТОВЫЕ ОБРАБОТЧИКИ ("НАЧАТЬ" / СТАТУС)
 # ==============================================================================
 HELP_TEXT = (
     "🤖 **GAMES | Чат Менеджер**\n\n"
@@ -347,13 +345,7 @@ HELP_TEXT = (
 )
 
 
-@bot.on.message(text=["/помощь", "помощь", "/help", "/хелп", "/команды", "команды"])
-async def cmd_help(msg: Message):
-    await msg.answer(HELP_TEXT)
-
-
-@bot.on.message(text=["/панель", "панель", "/панелл", "панелл", "/menu", "/panel"])
-async def cmd_panel(msg: Message):
+def build_main_keyboard(user_id: int) -> Keyboard:
     kb = (
         Keyboard(inline=True)
         .add(Text("📋 Команды", {"cmd": "help"}), color=KeyboardButtonColor.PRIMARY)
@@ -362,9 +354,52 @@ async def cmd_panel(msg: Message):
         .add(Text("📊 Моя стата", {"cmd": "stats"}), color=KeyboardButtonColor.SECONDARY)
         .add(Text("📩 Репорты", {"cmd": "reports"}), color=KeyboardButtonColor.SECONDARY)
     )
-    if is_owner(msg.from_id):
+    if is_owner(user_id):
         kb.row().add(Text("💾 Скачать БД", {"cmd": "dump_db"}), color=KeyboardButtonColor.NEGATIVE)
-    await msg.answer("⚙️ **Панель управления GAMES | Чат Менеджер**\nВыберите нужный раздел:", keyboard=kb)
+    return kb
+
+
+@bot.on.message(payload={"command": "start"})
+async def btn_vk_start_payload(msg: Message):
+    await msg.answer(
+        f"✅ Бот **GAMES | Чат Менеджер** онлайн и готов к работе!\n"
+        f"Ваш ранг: **{get_rank(msg.peer_id, msg.from_id)} lvl**\n"
+        f"Напишите `/помощь` или нажмите кнопку ниже:",
+        keyboard=build_main_keyboard(msg.from_id),
+    )
+
+
+@bot.on.message(text=["начать", "Начать", "/start", "старт", "/старт"])
+async def cmd_start_word(msg: Message):
+    await msg.answer(
+        f"✅ Бот **GAMES | Чат Менеджер** онлайн и готов к работе!\n"
+        f"Ваш ранг: **{get_rank(msg.peer_id, msg.from_id)} lvl**\n"
+        f"Напишите `/помощь` или откройте `/панель`:",
+        keyboard=build_main_keyboard(msg.from_id),
+    )
+
+
+@bot.on.message(text=["/статус", "статус", "/status", "status"])
+async def cmd_status(msg: Message):
+    await msg.answer(
+        f"🟢 **Статус: ONLINE**\n"
+        f"• Бесед в базе: **{len(db['chats'])}**\n"
+        f"• Игроков в экономике: **{len(db['economy'])}**\n"
+        f"• Ваш ранг: **{get_rank(msg.peer_id, msg.from_id)} lvl**"
+    )
+
+
+@bot.on.message(text=["/помощь", "помощь", "/help", "/хелп", "/команды", "команды"])
+async def cmd_help(msg: Message):
+    await msg.answer(HELP_TEXT)
+
+
+@bot.on.message(text=["/панель", "панель", "/панелл", "панелл", "/menu", "/panel"])
+async def cmd_panel(msg: Message):
+    await msg.answer(
+        "⚙️ **Панель управления GAMES | Чат Менеджер**\nВыберите нужный раздел:",
+        keyboard=build_main_keyboard(msg.from_id),
+    )
 
 
 @bot.on.message(payload={"cmd": "help"})
@@ -954,7 +989,6 @@ async def cmd_admins(msg: Message):
     await msg.answer("\n".join(lines))
 
 
-# Свой ник (/ник) и чужой ник (/сник — по умолчанию с 15 lvl, настраивается через /доступ сник [ранг])
 @bot.on.message(text=["/ник <nick>"])
 async def cmd_self_nick(msg: Message, nick: str):
     if msg.peer_id < 2000000000:
@@ -1517,6 +1551,7 @@ async def start_web_server():
 
 
 async def main():
+    print("[BOOT] Starting GAMES | Chat Manager web server and VK Long Poll...")
     await start_web_server()
     await bot.run_polling()
 
