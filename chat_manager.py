@@ -39,6 +39,61 @@ DEFAULT_ROLES = {
     100: "Владелец чата",
 }
 
+DEFAULT_CMD_RANKS = {
+    "заметка": 15, "addnote": 15,
+    "удзаметку": 15, "delnote": 15,
+    "мут": 45, "mute": 45,
+    "анмут": 45, "размут": 45, "unmute": 45, "unmite": 45,
+    "кик": 45, "kick": 45,
+    "варн": 45, "warn": 45,
+    "варны": 45, "warns": 45,
+    "анварн": 45, "снятварн": 45, "unwarn": 45,
+    "очистить": 45, "чистка": 45, "clear": 45,
+    "закреп": 45, "pin": 45,
+    "откреп": 45, "unpin": 45,
+    "лок": 45, "lock": 45,
+    "анлок": 45, "unlock": 45,
+    "бан": 55, "ban": 55,
+    "анбан": 55, "разбан": 55, "unban": 55,
+    "банлист": 55, "banlist": 55,
+    "чекбан": 55, "chekban": 55, "checkban": 55,
+    "снятьвсеварны": 55, "clearwarns": 55,
+    "статачата": 55, "statschat": 55,
+    "сник": 60, "сетник": 60, "snick": 60, "setnick": 60,
+    "делник": 60, "delnick": 60,
+    "сетлидер": 60, "поставитьлидера": 60, "setleader": 60,
+    "снятлидера": 60, "removeleader": 60,
+    "репорты": 60, "reports": 60,
+    "ответить": 60, "answer": 60,
+    "созыв": 60, "call": 60, "all": 60,
+    "сетадмин": 70, "выдатьадм": 70, "выдатьроль": 70, "роль": 70, "setadmin": 70,
+    "снятьроль": 70, "снятадм": 70, "removerole": 70,
+    "повысить": 70, "promote": 70,
+    "понизить": 70, "demote": 70,
+    "выговор": 70, "reprimand": 70, "vig": 70,
+    "выговоры": 70, "reprimands": 70, "vigs": 70,
+    "снятьвыговор": 70, "unreprimand": 70, "unvig": 70,
+    "снятьвсевыговоры": 70, "clearreprimands": 70,
+    "сетправила": 70, "setrules": 70,
+    "сбросправил": 70, "resetrules": 70,
+    "сетпривет": 70, "setgreet": 70,
+    "сброспривета": 70, "resetgreet": 70,
+    "размутвсех": 70, "unmuteall": 70,
+    "антибот": 70, "antibot": 70,
+    "антиреклама": 70, "antiads": 70,
+    "антиспам": 70, "antispam": 70,
+    "антикапс": 70, "caps": 70,
+    "антифлуд": 70, "antiflood": 70,
+    "логи": 70, "logs": 70,
+    "новаяроль": 90, "newrole": 90,
+    "удалитьроль": 90, "delrole": 90,
+    "сбросролей": 90, "resetroles": 90,
+    "сетназвание": 90, "setproject": 90,
+    "сетссылка": 90, "seturl": 90,
+    "сетвладелец": 90, "setowner": 90,
+    "сбросвладельца": 90, "resetowner": 90,
+}
+
 bot = Bot(token=TOKEN)
 
 
@@ -85,6 +140,7 @@ def save_db(data: dict) -> None:
 
 db = load_db()
 user_states: dict[int, str] = {}
+cmd_wizard_state: dict[tuple[int, int], dict] = {}
 user_cache: dict[int, dict] = {}
 flood_tracker: dict[tuple[int, int], list[float]] = {}
 rep_cooldown: dict[tuple[int, int], float] = {}
@@ -129,7 +185,7 @@ def get_chat_data(peer_id: int) -> dict:
         "bans": {},
         "notes": {},
         "reputation": {},
-        "custom_cmds": {},
+        "cmd_access": {},
         "role_names": {str(k): v for k, v in DEFAULT_ROLES.items()},
     }
     if pid not in db["chats"] or not isinstance(db["chats"][pid], dict):
@@ -142,9 +198,19 @@ def get_chat_data(peer_id: int) -> dict:
             chat[k] = v
     if not isinstance(chat.get("role_names"), dict) or not chat["role_names"]:
         chat["role_names"] = {str(k): v for k, v in DEFAULT_ROLES.items()}
-    if not isinstance(chat.get("custom_cmds"), dict):
-        chat["custom_cmds"] = {}
+    if not isinstance(chat.get("cmd_access"), dict):
+        chat["cmd_access"] = {}
     return chat
+
+
+def get_cmd_req_rank(chat_data: dict, cmd_name: str, default_rank: int = 0) -> int:
+    c_key = cmd_name.lstrip("/").lower()
+    overrides = chat_data.get("cmd_access", {})
+    if c_key in overrides:
+        return max(0, min(100, int(overrides[c_key])))
+    if c_key in DEFAULT_CMD_RANKS:
+        return int(DEFAULT_CMD_RANKS[c_key])
+    return default_rank
 
 
 # =====================================================================
@@ -308,7 +374,7 @@ def build_welcome_guide(chat_data: dict) -> str:
         f"👋 ═══ {proj_name} — БОТ ПОДКЛЮЧЁН ═══ 👋\n\n"
         "• Команды и ранги: `/help`\n"
         "• Игры (в т.ч. Пинтибот): `/игры`\n"
-        "• Конструктор команд с 0–100 рангом (с 100 lvl): `/кмд`\n"
+        "• Настройка доступа команд по рангу 0–100 (с 100 lvl): `/кмд`\n"
         "• Панель кнопок: `/menu` или `/панель`"
     )
 
@@ -514,7 +580,7 @@ def build_full_help_with_ranks(proj_name: str) -> str:
         "👑 **60+ lvl:** `/ник`, `/нлист`, `/сник`, `/делник`, `/сетлидер`, `/снятлидера`, `/репорты`, `/ответить`, `/созыв`\n"
         "⚡ **70+ lvl:** `/сетадмин`, `/снятьроль`, `/повысить`, `/понизить`, `/выговор`, `/выговоры`, `/снятьвыговор`, `/снятьвсевыговоры`, `/сетправила`, `/сбросправил`, `/сетпривет`, `/сброспривета`, `/размутвсех`, `/антибот`, `/антиреклама`, `/антиспам`, `/антикапс`, `/антифлуд`, `/логи`\n"
         "🔥 **90+ lvl:** `/новаяроль`, `/удалитьроль`, `/сбросролей`, `/сетназвание`, `/сетссылка`, `/сетвладелец`, `/сбросвладельца`\n"
-        "👑 **100 lvl (Владелец чата):** `/кмд создать [имя] [0-100] [ответ]` | `/кмд удалить [имя]` | `/кмд список`"
+        "👑 **100 lvl (Владелец чата):** `/кмд` (ввод команды и ранга `0–100`, доступ от этого ранга и выше) или `/кмд [команда] [0-100]`"
     )
 
 
@@ -555,7 +621,7 @@ async def private_handler(message: Message):
         await message.answer(
             f"👑 ═══ {DEFAULT_PROJECT_NAME} — ПАНЕЛЬ УПРАВЛЕНИЯ ═══ 👑\n\n"
             "• Бот работает во всех подключённых беседах без пулов и сетевых команд.\n"
-            "• Антибот, антиреклама, игры, `/кмд` (с 100 lvl, ранг 0–100) и модерация готовы к работе.",
+            "• Антибот, антиреклама, игры, `/кмд` (с 100 lvl, доступ с ранга `0–100` и выше) и модерация готовы к работе.",
             keyboard=get_private_keyboard(uid)
         )
         return
@@ -718,8 +784,45 @@ async def chat_handler(message: Message):
     proj_url = chat_data.get("project_url", DEFAULT_PROJECT_URL)
     user_lvl = get_user_level_by_id(uid_int, chat_data, owner_id)
 
+    # --- Интерактивный мастер /кмд (шаг 1: выбор команды, шаг 2: выбор ранга 0-100) ---
+    wiz_key = (peer_id, uid_int)
+    wiz = cmd_wizard_state.get(wiz_key)
+    if wiz:
+        if clean_text in ["отмена", "/отмена", "cancel", "/cancel"]:
+            cmd_wizard_state.pop(wiz_key, None)
+            return await message.answer("❌ Настройка команды через `/кмд` отменена.")
+
+        if wiz.get("step") == "wait_cmd":
+            chosen_cmd = raw_text.lstrip("/").split()[0].lower()
+            if not chosen_cmd:
+                return await message.answer("❌ Напиши название команды (например: `мут`, `бан`, `пинтибот`) или `отмена`.")
+            wiz["cmd"] = chosen_cmd
+            wiz["step"] = "wait_rank"
+            cmd_wizard_state[wiz_key] = wiz
+            return await message.answer(
+                f"🔢 Укажи минимальный ранг от **`0` до `100`** для команды `/{chosen_cmd}`\n"
+                f"Доступ сразу применится для ранга **`>=` указанного** и выше."
+            )
+
+        if wiz.get("step") == "wait_rank":
+            if not raw_text.isdigit():
+                return await message.answer("❌ Введи число от `0` до `100` (например: `45`) или `отмена`.")
+            req_rank = int(raw_text)
+            if req_rank < 0 or req_rank > 100:
+                return await message.answer("❌ Ранг должен быть в пределах от `0` до `100`.")
+            target_cmd = wiz["cmd"]
+            cmd_wizard_state.pop(wiz_key, None)
+            chat_data.setdefault("cmd_access", {})[target_cmd] = req_rank
+            save_db(db)
+            add_log(f"Доступ к /{target_cmd} установлен с {req_rank} lvl и выше в чате {peer_id} от {await format_vk_user(uid_int)}")
+            return await message.answer(
+                f"✅ **Применено!**\n"
+                f"• Команда: `/{target_cmd}`\n"
+                f"• Доступ: с **`{req_rank} lvl`** и выше (`>= {req_rank}`)"
+            )
+
     # --- Закрытый чат (/лок) ---
-    if chat_data.get("locked") and user_lvl < 45 and not clean_text.startswith("/"):
+    if chat_data.get("locked") and user_lvl < get_cmd_req_rank(chat_data, "лок", 45) and not clean_text.startswith("/"):
         try:
             await bot.api.messages.delete(
                 peer_id=peer_id,
@@ -751,7 +854,7 @@ async def chat_handler(message: Message):
             return
 
     # --- Антифлуд ---
-    if chat_data.get("antiflood") and user_lvl < 45:
+    if chat_data.get("antiflood") and user_lvl < get_cmd_req_rank(chat_data, "антифлуд", 70):
         now_t = time.time()
         key_fl = (peer_id, uid_int)
         stamps = [t for t in flood_tracker.get(key_fl, []) if now_t - t < 6.0]
@@ -769,7 +872,7 @@ async def chat_handler(message: Message):
             return
 
     # --- Антиспам ссылок ---
-    if chat_data.get("antispam") and user_lvl < 45:
+    if chat_data.get("antispam") and user_lvl < get_cmd_req_rank(chat_data, "антиспам", 70):
         if any(bad in clean_text for bad in ["http://", "https://", "t.me/", "vk.me/", "discord.gg/"]):
             try:
                 await bot.api.messages.delete(
@@ -783,7 +886,7 @@ async def chat_handler(message: Message):
             return
 
     # --- Антиреклама ---
-    if chat_data.get("antiads") and user_lvl < 45:
+    if chat_data.get("antiads") and user_lvl < get_cmd_req_rank(chat_data, "антиреклама", 70):
         if any(tag in clean_text for tag in ["[club", "[public", "vk.com/join", "vk.me/", "t.me/", "пиар", "реклама", "заходи в", "беседа"]):
             try:
                 await bot.api.messages.delete(
@@ -797,7 +900,7 @@ async def chat_handler(message: Message):
             return
 
     # --- Антикапс ---
-    if chat_data.get("caps_guard") and user_lvl < 45 and len(raw_text) >= 10:
+    if chat_data.get("caps_guard") and user_lvl < get_cmd_req_rank(chat_data, "антикапс", 70) and len(raw_text) >= 10:
         letters = [c for c in raw_text if c.isalpha()]
         if letters and (sum(1 for c in letters if c.isupper()) / len(letters)) >= 0.8:
             try:
@@ -849,7 +952,7 @@ async def chat_handler(message: Message):
             "• `60+ lvl`: `/ник`, `/нлист`, `/сник`, `/делник`, `/сетлидер`, `/снятлидера`, `/репорты`, `/ответить`, `/созыв`\n"
             "• `70+ lvl`: `/сетадмин`, `/снятьроль`, `/повысить`, `/понизить`, `/выговор`, `/выговоры`, `/снятьвыговор`, `/сетправила`, `/сетпривет`, `/размутвсех`, `/антибот`, `/антиреклама`, `/антиспам`, `/антикапс`, `/антифлуд`, `/логи`\n"
             "• `90+ lvl`: `/новаяроль`, `/удалитьроль`, `/сбросролей`, `/сетназвание`, `/сетссылка`, `/сетвладелец`, `/сбросвладельца`\n"
-            "• `100 lvl`: `/кмд создать [имя] [0-100] [текст]`, `/кмд удалить [имя]`, `/кмд список`",
+            "• `100 lvl`: `/кмд` — настройка доступа любой команды с ранга `0–100` и выше",
             keyboard=get_chat_inline_keyboard()
         )
 
@@ -883,75 +986,40 @@ async def chat_handler(message: Message):
     params = args[1:] if len(args) > 1 else []
 
     # =================================================================
-    # КОНСТРУКТОР КАСТОМНЫХ КОМАНД /КМД (ДОСТУПЕН С 100 LVL, РАНГ 0–100)
+    # НАСТРОЙКА ДОСТУПА КОМАНД ПО РАНГУ 0–100 (/КМД — ДОСТУПНО С 100 LVL)
     # =================================================================
     if cmd in ["кмд", "cmd"]:
         if user_lvl < 100:
             return await message.answer(f"❌ Команда `/кмд` доступна только с `100 lvl` (у вас: `{user_lvl} lvl`).")
 
-        sub = params[0].lower() if params else "список"
-
-        if sub in ["список", "list"]:
-            c_cmds = chat_data.get("custom_cmds", {})
-            if not c_cmds:
-                return await message.answer(
-                    "📋 В этой беседе нет кастомных команд.\n"
-                    "Создать: `/кмд создать [имя] [0-100] [ответ]`"
-                )
-            lines = [
-                f"• `/{k}` — ранг **`{v.get('min_rank', 0)} lvl`** ➔ {v.get('response', '')}"
-                for k, v in c_cmds.items()
-            ]
-            return await message.answer("⚙️ ═══ КАСТОМНЫЕ КОМАНДЫ БЕСЕДЫ ═══ ⚙️\n\n" + "\n".join(lines))
-
-        if sub in ["удалить", "del", "remove"]:
-            if len(params) < 2:
-                return await message.answer("❌ Формат: `/кмд удалить [имя_команды]`")
-            c_name = params[1].lstrip("/").lower()
-            if c_name in chat_data.get("custom_cmds", {}):
-                del chat_data["custom_cmds"][c_name]
-                save_db(db)
-                return await message.answer(f"🗑 Команда `/{c_name}` удалена.")
-            return await message.answer(f"❌ Команда `/{c_name}` не найдена.")
-
-        if sub in ["создать", "add", "set"]:
-            if len(params) < 4 or not params[2].isdigit():
-                return await message.answer("❌ Формат: `/кмд создать [имя] [ранг 0-100] [текст ответа]`")
-            c_name = params[1].lstrip("/").lower()
-            min_rank = int(params[2])
-            if min_rank < 0 or min_rank > 100:
-                return await message.answer("❌ Ранг команды должен быть в диапазоне от `0` до `100`.")
-            reply_txt = " ".join(params[3:]).strip()
-            chat_data["custom_cmds"][c_name] = {
-                "min_rank": min_rank,
-                "response": reply_txt,
-            }
+        # Вариант 1: сразу одной строкой `/кмд [команда] [0-100]`
+        if len(params) >= 2 and params[1].isdigit():
+            target_cmd = params[0].lstrip("/").lower()
+            req_rank = int(params[1])
+            if req_rank < 0 or req_rank > 100:
+                return await message.answer("❌ Ранг должен быть от `0` до `100`.")
+            chat_data.setdefault("cmd_access", {})[target_cmd] = req_rank
             save_db(db)
-            add_log(f"Создана команда /{c_name} ({min_rank} lvl) в чате {peer_id} от {await format_vk_user(uid_int)}")
+            add_log(f"Доступ к /{target_cmd} установлен с {req_rank} lvl и выше в чате {peer_id} от {await format_vk_user(uid_int)}")
             return await message.answer(
-                f"✅ Команда `/{c_name}` сохранена!\n"
-                f"• Требуемый ранг: **`{min_rank} lvl`**\n"
-                f"• Ответ: {reply_txt}"
+                f"✅ **Применено!**\n"
+                f"• Команда: `/{target_cmd}`\n"
+                f"• Доступ: с **`{req_rank} lvl`** и выше (`>= {req_rank}`)"
             )
 
-        if len(params) >= 3 and params[1].isdigit():
-            c_name = params[0].lstrip("/").lower()
-            min_rank = int(params[1])
-            if min_rank < 0 or min_rank > 100:
-                return await message.answer("❌ Ранг команды должен быть от `0` до `100`.")
-            reply_txt = " ".join(params[2:]).strip()
-            chat_data["custom_cmds"][c_name] = {
-                "min_rank": min_rank,
-                "response": reply_txt,
-            }
-            save_db(db)
-            return await message.answer(f"✅ Команда `/{c_name}` (`{min_rank} lvl`) создана!")
-
+        # Вариант 2: пошаговый режим — пишешь `/кмд`, потом команду, потом ранг `0–100`
+        cmd_wizard_state[wiz_key] = {"step": "wait_cmd"}
         return await message.answer(
-            "⚙️ **Управление /кмд (доступно со 100 lvl):**\n"
-            "• `/кмд создать [имя] [0-100] [ответ]`\n"
-            "• `/кмд удалить [имя]`\n"
-            "• `/кмд список`"
+            "⚙️ **Настройка доступа команды по рангу (с 100 lvl)**\n\n"
+            "Напиши команду, которую нужно изменить (например: `мут`, `бан`, `ник`, `пинтибот`), и отправь сообщением.\n"
+            "*(Для отмены напиши `отмена`)*"
+        )
+
+    # Проверка доступа к вызванной команде с учётом /кмд (доступ с указанного ранга и выше)
+    req_cmd_rank = get_cmd_req_rank(chat_data, cmd, default_rank=0)
+    if user_lvl < req_cmd_rank:
+        return await message.answer(
+            f"❌ Команда `/{cmd}` доступна с **`{req_cmd_rank} lvl`** и выше (у вас: `{user_lvl} lvl`)."
         )
 
     # =================================================================
@@ -986,7 +1054,7 @@ async def chat_handler(message: Message):
                 "• `/сетадмин @цель [уровень]` (`70+ lvl`) / `/снятьроль @цель` (`70+ lvl`)\n"
                 "• `/повысить @цель [ур]` / `/понизить @цель [ур]` (`70+ lvl`)\n"
                 "• `/новаяроль [ур] [Название]` / `/удалитьроль [ур]` / `/сбросролей` (`90+ lvl`)\n"
-                "• `/кмд создать [имя] [0-100] [ответ]` / `/кмд удалить [имя]` / `/кмд список` (`100 lvl`)",
+                "• `/кмд` — настройка доступа команды с ранга `0–100` и выше (`100 lvl`)",
                 keyboard=get_chat_inline_keyboard()
             )
 
@@ -1137,8 +1205,6 @@ async def chat_handler(message: Message):
         return await message.answer("🏆 ═══ ТОП РЕПУТАЦИИ БЕСЕДЫ ═══ 🏆\n\n" + "\n".join(lines))
 
     elif cmd in ["созыв", "call", "all"]:
-        if user_lvl < 60:
-            return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
         call_msg = " ".join(params).strip() if params else "Внимание всем участникам беседы!"
         return await message.answer(
             f"📣 **ОБЩИЙ СОЗЫВ АДМИНИСТРАЦИИ**\n"
@@ -1174,8 +1240,6 @@ async def chat_handler(message: Message):
         return await message.answer("📝 ═══ ЗАМЕТКИ БЕСЕДЫ ═══ 📝\n\n" + "\n".join(lines))
 
     elif cmd in ["заметка", "addnote"]:
-        if user_lvl < 15:
-            return await message.answer(f"❌ Требуется 15+ уровень (у вас: {user_lvl}).")
         body = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
         if "|" not in body:
             return await message.answer("❌ Формат: `/заметка [название] | [текст]`")
@@ -1187,8 +1251,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"✅ Заметка **{k.lower()}** сохранена.")
 
     elif cmd in ["удзаметку", "delnote"]:
-        if user_lvl < 15:
-            return await message.answer(f"❌ Требуется 15+ уровень (у вас: {user_lvl}).")
         if not params:
             return await message.answer("❌ Формат: `/удзаметку [название]`")
         k = " ".join(params).strip().lower()
@@ -1210,8 +1272,6 @@ async def chat_handler(message: Message):
         return await message.answer("👑 Статус подтверждён! Вы закреплены владельцем этой беседы (`100 lvl`).")
 
     elif cmd in ["сбросвладельца", "resetowner"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         old_owner = chat_data.get("owner_id")
         chat_data["owner_id"] = None
         if old_owner and str(old_owner) in chat_data["members"]:
@@ -1220,8 +1280,6 @@ async def chat_handler(message: Message):
         return await message.answer("♻️ Владелец беседы сброшен.")
 
     elif cmd in ["setrules", "сетправила"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         new_rules = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
         if not new_rules:
             return await message.answer("❌ Формат: `/сетправила [новый текст правил беседы]`")
@@ -1230,15 +1288,11 @@ async def chat_handler(message: Message):
         return await message.answer("✅ Новые правила беседы сохранены!")
 
     elif cmd in ["resetrules", "сбросправил"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         chat_data["rules_text"] = DEFAULT_RULES
         save_db(db)
         return await message.answer("♻️ Правила беседы сброшены к стандартным.")
 
     elif cmd in ["сетпривет", "setgreet"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         g_txt = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
         if not g_txt:
             return await message.answer("❌ Формат: `/сетпривет Добро пожаловать, {user}, в {chat}!`")
@@ -1247,15 +1301,11 @@ async def chat_handler(message: Message):
         return await message.answer("✅ Приветствие при входе сохранено.")
 
     elif cmd in ["сброспривета", "resetgreet"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         chat_data["greeting_text"] = ""
         save_db(db)
         return await message.answer("♻️ Приветствие при входе отключено.")
 
     elif cmd in ["setproject", "сетназвание"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         new_name = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
         if not new_name:
             return await message.answer("❌ Формат: `/сетназвание [Название проекта]`")
@@ -1264,8 +1314,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"✅ Название проекта для этой беседы изменено на: **{chat_data['project_name']}**")
 
     elif cmd in ["seturl", "сетссылка"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         if not params:
             return await message.answer("❌ Формат: `/сетссылка [https://...]`")
         chat_data["project_url"] = params[0].strip()
@@ -1357,8 +1405,6 @@ async def chat_handler(message: Message):
         )
 
     elif cmd in ["reports", "репорты"]:
-        if user_lvl < 60:
-            return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
         chat_reps = [r for r in db.get("reports", []) if r.get("peer_id") == peer_id][-8:]
         if not chat_reps:
             return await message.answer("📋 В этой беседе пока нет репортов.")
@@ -1373,8 +1419,6 @@ async def chat_handler(message: Message):
         return await message.answer("📩 ═══ РЕПОРТЫ БЕСЕДЫ ═══ 📩\n\n" + "\n\n".join(lines))
 
     elif cmd in ["ответить", "answer"]:
-        if user_lvl < 60:
-            return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
         if len(params) < 2 or not params[0].lstrip("#").isdigit():
             return await message.answer("❌ Формат: `/ответить [номер репорта] [текст ответа]`")
         target_rep_id = int(params[0].lstrip("#"))
@@ -1418,8 +1462,6 @@ async def chat_handler(message: Message):
         return await message.answer("📋 ═══ АКТИВНЫЕ НИКНЕЙМЫ ═══ 📋\n\n" + "\n".join(nlist_lines))
 
     elif cmd in ["snick", "сник", "setnick", "сетник"]:
-        if user_lvl < 60:
-            return await message.answer(f"❌ Недостаточно прав! Требуется 60+ уровень (у вас: {user_lvl}).")
         orig_parts = raw_text.split()[1:]
         if not orig_parts:
             return await message.answer("❌ Формат: `/сник [@ник/id/ответ] [Ник]`")
@@ -1435,8 +1477,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"✅ Ник **{new_nick}** выдан {await format_vk_user(target_id)}.")
 
     elif cmd in ["delnick", "делник"]:
-        if user_lvl < 60:
-            return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите пользователя.")
@@ -1448,8 +1488,6 @@ async def chat_handler(message: Message):
         return await message.answer("❌ Никнейм не найден в базе.")
 
     elif cmd in ["newrole", "новаяроль"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         if len(params) < 2 or not params[0].isdigit():
             return await message.answer("❌ Формат: `/новаяроль [ур] [Название]`")
         lvl_key = str(int(params[0]))
@@ -1459,8 +1497,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"✅ Роль для уровня `{lvl_key} lvl` установлена: **{r_name}**")
 
     elif cmd in ["delrole", "удалитьроль"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         if not params or not params[0].isdigit():
             return await message.answer("❌ Укажите числовой уровень роли, например: `/удалитьроль 75`")
         lvl_key = str(int(params[0]))
@@ -1471,15 +1507,11 @@ async def chat_handler(message: Message):
         return await message.answer("❌ Указанная роль не найдена.")
 
     elif cmd in ["resetroles", "сбросролей"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         chat_data["role_names"] = {str(k): v for k, v in DEFAULT_ROLES.items()}
         save_db(db)
         return await message.answer("♻️ Список ролей беседы сброшен к стандартному.")
 
     elif cmd in ["setadmin", "сетадмин", "выдатьадм", "выдатьроль", "роль"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Формат: `/сетадмин [@ник/id/ответ] [уровень]`")
@@ -1496,8 +1528,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"✅ {t_fmt} присвоен ранг `{lvl_val} lvl` (**{get_role_title(lvl_val, chat_data)}**).")
 
     elif cmd in ["повысить", "promote"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Формат: `/повысить [@ник/id/ответ] [новый_уровень]`")
@@ -1511,8 +1541,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"⬆️ {t_fmt} повышен до `{new_lvl} lvl` (**{get_role_title(new_lvl, chat_data)}**).")
 
     elif cmd in ["понизить", "demote"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Формат: `/понизить [@ник/id/ответ] [новый_уровень]`")
@@ -1526,8 +1554,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"⬇️ {t_fmt} понижен до `{new_lvl} lvl` (**{get_role_title(new_lvl, chat_data)}**).")
 
     elif cmd in ["removerole", "снятьроль", "снятадм"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите пользователя.")
@@ -1543,8 +1569,6 @@ async def chat_handler(message: Message):
     # ВЫГОВОРЫ АДМИНАМ, МОДЕРАЦИЯ И ЗАЩИТА
     # =================================================================
     elif cmd in ["выговор", "reprimand", "vig"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Формат: `/выговор [@ник/id/ответ] [причина]`")
@@ -1575,8 +1599,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"📕 **Выговоры {u_fmt} (`{len(r_list)}/3`):**\n\n{reasons}")
 
     elif cmd in ["снятьвыговор", "unreprimand", "unvig"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if tid and str(tid) in chat_data["reprimands"] and chat_data["reprimands"][str(tid)]:
             chat_data["reprimands"][str(tid)].pop()
@@ -1585,8 +1607,6 @@ async def chat_handler(message: Message):
         return await message.answer("❌ У пользователя нет активных выговоров.")
 
     elif cmd in ["снятьвсевыговоры", "clearreprimands"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите пользователя.")
@@ -1648,22 +1668,16 @@ async def chat_handler(message: Message):
         )
 
     elif cmd in ["lock", "лок"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Требуется 45+ уровень (у вас: {user_lvl}).")
         chat_data["locked"] = True
         save_db(db)
-        return await message.answer("🔒 Беседа закрыта для обычных участников (сообщения ниже 45 lvl удаляются).")
+        return await message.answer("🔒 Беседа закрыта для обычных участников (сообщения ниже порога `/лок` удаляются).")
 
     elif cmd in ["unlock", "анлок"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Требуется 45+ уровень (у вас: {user_lvl}).")
         chat_data["locked"] = False
         save_db(db)
         return await message.answer("🔓 Беседа открыта для всех участников.")
 
     elif cmd in ["mute", "мут"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Ошибка доступа! Требуется 45+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите цель для мута (`@ник`, `id` или ответ).")
@@ -1674,16 +1688,12 @@ async def chat_handler(message: Message):
         return await message.answer(f"🤫 {await format_vk_user(tid)} замучен на `{mins}` мин.")
 
     elif cmd in ["unmuteall", "размутвсех"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         cnt = len(chat_data.get("mutes", {}))
         chat_data["mutes"] = {}
         save_db(db)
         return await message.answer(f"🔊 Сняты все активные муты в беседе (`{cnt}`).")
 
     elif cmd in ["unmute", "unmite", "анмут", "размут"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Недостаточно прав (нужен 45+, у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if tid and str(tid) in chat_data["mutes"]:
             del chat_data["mutes"][str(tid)]
@@ -1692,8 +1702,6 @@ async def chat_handler(message: Message):
         return await message.answer("❌ Активных мутов у игрока не найдено.")
 
     elif cmd in ["ban", "бан"]:
-        if user_lvl < 55:
-            return await message.answer(f"❌ Требуется 55+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите цель для бана.")
@@ -1709,8 +1717,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"🚫 {await format_vk_user(tid)} заблокирован в чате. Причина: {reason}")
 
     elif cmd in ["unban", "анбан", "разбан"]:
-        if user_lvl < 55:
-            return await message.answer(f"❌ Требуется 55+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if tid and str(tid) in chat_data["bans"]:
             del chat_data["bans"][str(tid)]
@@ -1739,8 +1745,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"📈 **СТАТИСТИКА БЕСЕДЫ:**\n• Участников в базе чата: `{m_count}`\n• Всего активных чатов: `{c_count}`")
 
     elif cmd in ["kick", "кик"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Требуется 45+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите цель для кика.")
@@ -1753,8 +1757,6 @@ async def chat_handler(message: Message):
             return await message.answer(f"❌ Ошибка кика (проверьте права бота в беседе): {e}")
 
     elif cmd in ["warn", "варн"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Требуется 45+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите цель для варна.")
@@ -1787,8 +1789,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"⚠️ **Варны {u_fmt} (`{len(w_list)}/3`):**\n\n{reasons}")
 
     elif cmd in ["unwarn", "анварн", "снятварн"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Требуется 45+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if tid and str(tid) in chat_data["warns"] and chat_data["warns"][str(tid)]:
             chat_data["warns"][str(tid)].pop()
@@ -1797,8 +1797,6 @@ async def chat_handler(message: Message):
         return await message.answer("❌ У игрока нет активных предупреждений.")
 
     elif cmd in ["clearwarns", "снятьвсеварны"]:
-        if user_lvl < 55:
-            return await message.answer(f"❌ Требуется 55+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Укажите пользователя.")
@@ -1807,48 +1805,36 @@ async def chat_handler(message: Message):
         return await message.answer(f"🟢 Все варны сняты у {await format_vk_user(tid)}.")
 
     elif cmd in ["antibot", "антибот"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         chat_data["antibot"] = not bool(chat_data.get("antibot"))
         save_db(db)
         state_txt = "🟢 ВКЛЮЧЁН (авто-кик ботов и подозрительных аккаунтов)" if chat_data["antibot"] else "🔴 ВЫКЛЮЧЕН"
         return await message.answer(f"🤖 Режим антибота в беседе: {state_txt}.")
 
     elif cmd in ["antispam", "антиспам"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         chat_data["antispam"] = not bool(chat_data.get("antispam"))
         save_db(db)
-        state_txt = "🟢 ВКЛЮЧЁН (ссылки у участников <45 lvl удаляются)" if chat_data["antispam"] else "🔴 ВЫКЛЮЧЕН"
+        state_txt = "🟢 ВКЛЮЧЁН (ссылки у участников ниже порога удаляются)" if chat_data["antispam"] else "🔴 ВЫКЛЮЧЕН"
         return await message.answer(f"🛡 Режим антиспама в беседе: {state_txt}.")
 
     elif cmd in ["caps", "антикапс"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         chat_data["caps_guard"] = not bool(chat_data.get("caps_guard"))
         save_db(db)
         state_txt = "🟢 ВКЛЮЧЁН" if chat_data["caps_guard"] else "🔴 ВЫКЛЮЧЕН"
         return await message.answer(f"🔠 Режим антикапса в беседе: {state_txt}.")
 
     elif cmd in ["antiflood", "антифлуд"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         chat_data["antiflood"] = not bool(chat_data.get("antiflood"))
         save_db(db)
         state_txt = "🟢 ВКЛЮЧЁН" if chat_data["antiflood"] else "🔴 ВЫКЛЮЧЕН"
         return await message.answer(f"🌊 Режим антифлуда в беседе: {state_txt}.")
 
     elif cmd in ["antiads", "антиреклама"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Требуется 70+ уровень (у вас: {user_lvl}).")
         chat_data["antiads"] = not bool(chat_data.get("antiads"))
         save_db(db)
         state_txt = "🟢 ВКЛЮЧЁН (реклама, промо и ссылки на чаты/группы удаляются)" if chat_data["antiads"] else "🔴 ВЫКЛЮЧЕН"
         return await message.answer(f"🚫 Режим антирекламы в беседе: {state_txt}.")
 
     elif cmd in ["clear", "очистить", "чистка"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Требуется 45+ уровень (у вас: {user_lvl}).")
         count = int(params[0]) if params and params[0].isdigit() else 10
         count = max(1, min(count, 100))
         cmid = message.conversation_message_id or 0
@@ -1865,14 +1851,10 @@ async def chat_handler(message: Message):
             return await message.answer("❌ Не удалось удалить сообщения (выдайте боту права администратора чата).")
 
     elif cmd in ["logs", "логи"]:
-        if user_lvl < 70:
-            return await message.answer(f"❌ Доступно с 70 уровня (у вас: {user_lvl}).")
         recent = "\n".join(db["logs"][-15:])
         return await message.answer(f"📜 ═══ СИСТЕМНЫЕ ЛОГИ ═══ 📜\n\n{recent if recent else 'Журнал пуст'}")
 
     elif cmd in ["pin", "закреп"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Нужны права 45+ lvl (у вас: {user_lvl}).")
         if not message.reply_message:
             return await message.answer("❌ Сделайте реплай (ответ) на сообщение для закрепления.")
         try:
@@ -1882,8 +1864,6 @@ async def chat_handler(message: Message):
             return await message.answer("❌ Ошибка закрепления: выдайте боту права администратора беседы в ВК.")
 
     elif cmd in ["unpin", "откреп"]:
-        if user_lvl < 45:
-            return await message.answer(f"❌ Нужны права 45+ lvl (у вас: {user_lvl}).")
         try:
             await bot.api.messages.unpin(peer_id=peer_id)
             return await message.answer("📌 Закреплённое сообщение откреплено.")
@@ -1891,8 +1871,6 @@ async def chat_handler(message: Message):
             return await message.answer("❌ Ошибка открепления: выдайте боту права администратора беседы в ВК.")
 
     elif cmd in ["setowner", "сетвладелец"]:
-        if user_lvl < 90:
-            return await message.answer(f"❌ Требуется 90+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if not tid:
             return await message.answer("❌ Формат: `/сетвладелец [@ник/id/ответ]`")
@@ -1901,8 +1879,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"👑 Владельцем чата закреплён {await format_vk_user(tid)} (`100 lvl`).")
 
     elif cmd in ["setleader", "сетлидер", "поставитьлидера"]:
-        if user_lvl < 60:
-            return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
         tid, rem = await resolve_target(message, params)
         if not tid or not rem:
             return await message.answer("❌ Формат: `/сетлидер [@ник/id/ответ] [Организация]`")
@@ -1912,8 +1888,6 @@ async def chat_handler(message: Message):
         return await message.answer(f"👔 {await format_vk_user(tid)} назначен лидером организации **{org}**.")
 
     elif cmd in ["removeleader", "снятлидера"]:
-        if user_lvl < 60:
-            return await message.answer(f"❌ Требуется 60+ уровень (у вас: {user_lvl}).")
         tid, _ = await resolve_target(message, params)
         if tid and str(tid) in db["leaders"]:
             del db["leaders"][str(tid)]
@@ -1978,17 +1952,6 @@ async def chat_handler(message: Message):
         if not parts:
             return await message.answer("📋 Состав беседы пока пуст.")
         return await message.answer("📋 ═══ СОСТАВ БЕСЕДЫ ═══ 📋\n\n" + "\n\n".join(parts))
-
-    # =================================================================
-    # ВЫПОЛНЕНИЕ КАСТОМНЫХ КОМАНД ИЗ /КМД (ПРОВЕРКА РАНГА 0–100)
-    # =================================================================
-    elif cmd in chat_data.get("custom_cmds", {}):
-        c_cfg = chat_data["custom_cmds"][cmd]
-        req_rank = int(c_cfg.get("min_rank", 0) or 0)
-        if user_lvl < req_rank:
-            return await message.answer(f"❌ Для команды `/{cmd}` нужен ранг **`{req_rank} lvl`** (у вас: `{user_lvl} lvl`).")
-        out_txt = str(c_cfg.get("response", "")).replace("{user}", await format_vk_user(uid_int)).replace("{chat}", chat_title)
-        return await message.answer(out_txt)
 
 
 # =====================================================================
