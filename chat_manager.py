@@ -11,7 +11,7 @@ from vkbottle.bot import Message
 # =====================================================================
 # 1. КОНФИГУРАЦИЯ И ИНИЦИАЛИЗАЦИЯ
 # =====================================================================
-TOKEN = "vk1.a.5BfnzsvcbvRGCC9ZGxmbKdzOU-0NBWIPc9RovnKuIImAHcV46i4wMJUGvrkua3xKhDqo57KVoiXQOqhuctwA93--pk54OWAy_rfzgGfTTQFdG1vFzRObXKPTikSt3h1rRR6ImqGbPMaOgAC3vLaPxx359f9T4N2nl2d4dZGFInNv4F9LLsctf3GiuJfrBkqBcji79CiXrPLqeClPoXaptg"
+TOKEN = "vk1.a.ONWFvnPZaVTXfIN1NsuwhyGfU6LsNurMI8qT_pVrqm_pxrdIBRvh_ibzoBVUmX5DhOTv26MSpMPmeKEwCZvtIbjfCByslMQ7_-K7o8ipviBYTbslgWeMHoDeWZ5HXtBVPNNCGfkXdK0DsjOe71hXQBXPvfI6K1h3S4YfrPAd6k6I1u8v4Nmp5tZSmZkgISWrhX7WtIcbWkteWFeFXrUd-g"
 MAIN_OWNER_ID = 897082738
 DB_FILE = "bot_database.json"
 START_TIME = time.time()
