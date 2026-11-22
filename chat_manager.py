@@ -38,10 +38,10 @@ DEFAULT_DB: Dict[str, Any] = {
     "economy": {},
 }
 
-# Стандартные ранги команд (меняются для конкретной беседы через /кмд [команда] [ранг])
+# Стандартные ранги команд (команда `ник` удалена; `сник` и `делник` только для админов)
 DEFAULT_CMD_RANKS: Dict[str, int] = {
-    "ник": 0,
     "сник": 15,
+    "делник": 15,
     "мут": 30,
     "размут": 30,
     "варн": 40,
@@ -70,7 +70,7 @@ DEFAULT_CMD_RANKS: Dict[str, int] = {
     "снятьаварн": 75,
     "ранг": 80,
     "доступ": 95,
-    "кмд": 100,   # строго с 100 lvl
+    "кмд": 100,
 }
 
 BUSINESS_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -81,7 +81,6 @@ BUSINESS_CATALOG: Dict[str, Dict[str, Any]] = {
     "5": {"name": "Нефтевышка", "cost": 1200000, "income": 190000},
 }
 
-# Базовые маркеры жёсткого мата / оскорблений для /антимат
 PROFANITY_PATTERNS = [
     r"\b(?:сук[аиу]|бля[дт]|бл[яи]|ху[йеёюя]|пизд[аеиуё]|еба[нлть]|ёб[ануты]|муд[аои]|гандон|уёб\w*)\b",
 ]
@@ -145,6 +144,7 @@ def get_chat(peer_id: int) -> Dict[str, Any]:
         ("welcome", ""),
         ("antiswear", False),
         ("antibot", False),
+        ("nicks", {}),
     ]:
         if k not in chat:
             chat[k] = v
@@ -255,9 +255,6 @@ def parse_toggle_arg(arg: Optional[str], current_state: bool) -> bool:
     return not current_state
 
 
-# ==============================================================================
-# КНОПКИ (МЕНЮ / ПАНЕЛЬ / БЫСТРЫЕ КНОПКИ)
-# ==============================================================================
 def build_start_keyboard(user_id: int) -> Keyboard:
     kb = (
         Keyboard(inline=True)
@@ -290,9 +287,6 @@ def build_panel_keyboard(user_id: int, is_chat: bool) -> Keyboard:
     return kb
 
 
-# ==============================================================================
-# АВТОМОДЕРАЦИЯ, ЗАЩИТА И ПРИВЕТСТВИЯ В БЕСЕДАХ
-# ==============================================================================
 _last_msg_time: Dict[Tuple[int, int], float] = {}
 _last_msg_text: Dict[Tuple[int, int], str] = {}
 
@@ -305,26 +299,49 @@ async def run_chat_guard(msg: Message) -> bool:
     user_id = msg.from_id
     chat = get_chat(peer_id)
 
-    if msg.action and msg.action.type.value in ("chat_invite_user", "chat_invite_user_by_link"):
-        invited_id = msg.action.member_id or user_id
-        if invited_id < 0 and chat.get("antibot"):
+    if msg.action:
+        act_type = msg.action.type.value
+        member_id = msg.action.member_id or user_id
+
+        if act_type == "chat_kick_user" and member_id == user_id and member_id > 0:
+            left_name = await get_user_name(member_id)
             try:
-                await bot.api.messages.remove_chat_user(chat_id=peer_id - 2000000000, member_id=invited_id)
-                await msg.answer("🤖 Включён **Антибот**: сторонний бот автоматически исключён из беседы.")
+                await bot.api.messages.remove_chat_user(
+                    chat_id=peer_id - 2000000000, member_id=member_id
+                )
             except Exception:
                 pass
+            await msg.answer(f"🚪 {left_name} вышел ПСЖ и был кикнут ботом.")
             return True
-        if str(invited_id) in chat.get("bans", {}):
-            try:
-                await bot.api.messages.remove_chat_user(chat_id=peer_id - 2000000000, member_id=invited_id)
-                await msg.answer(f"🔨 {await get_user_name(invited_id)} находится в бане этой беседы и был исключён.")
-            except Exception:
-                pass
+
+        if act_type in ("chat_invite_user", "chat_invite_user_by_link"):
+            invited_id = member_id
+            if invited_id < 0 and chat.get("antibot"):
+                try:
+                    await bot.api.messages.remove_chat_user(
+                        chat_id=peer_id - 2000000000, member_id=invited_id
+                    )
+                    await msg.answer(
+                        "🤖 Включён **Антибот**: сторонний бот автоматически исключён из беседы."
+                    )
+                except Exception:
+                    pass
+                return True
+            if str(invited_id) in chat.get("bans", {}):
+                try:
+                    await bot.api.messages.remove_chat_user(
+                        chat_id=peer_id - 2000000000, member_id=invited_id
+                    )
+                    await msg.answer(
+                        f"🔨 {await get_user_name(invited_id)} находится в бане этой беседы и был исключён."
+                    )
+                except Exception:
+                    pass
+                return True
+            if chat.get("welcome"):
+                w_text = chat["welcome"].replace("{user}", await get_user_name(invited_id))
+                await msg.answer(w_text)
             return True
-        if chat.get("welcome"):
-            w_text = chat["welcome"].replace("{user}", await get_user_name(invited_id))
-            await msg.answer(w_text)
-        return True
 
     if user_id < 0:
         return False
@@ -344,7 +361,9 @@ async def run_chat_guard(msg: Message) -> bool:
     mute_until = float(chat["mutes"].get(str(user_id), 0))
     if mute_until > now and rank < 30:
         try:
-            await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
+            await bot.api.messages.delete(
+                peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True
+            )
         except Exception:
             pass
         return True
@@ -354,7 +373,9 @@ async def run_chat_guard(msg: Message) -> bool:
 
     if chat.get("locked") and rank < 50:
         try:
-            await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
+            await bot.api.messages.delete(
+                peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True
+            )
         except Exception:
             pass
         return True
@@ -363,49 +384,59 @@ async def run_chat_guard(msg: Message) -> bool:
     if not text or rank >= 30:
         return False
 
-    # 1. Антиреклама / антиссылки
     if chat.get("antilink") and re.search(
         r"(https?://|t\.me/|vk\.me/|vk\.cc/|vk\.com/join|discord\.gg/|@[\w_]+)", text, re.I
     ):
         try:
-            await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
-            await msg.answer(f"🚫 {await get_user_name(user_id)}, реклама и ссылки в этой беседе запрещены!")
+            await bot.api.messages.delete(
+                peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True
+            )
+            await msg.answer(
+                f"🚫 {await get_user_name(user_id)}, реклама и ссылки в этой беседе запрещены!"
+            )
         except Exception:
             pass
         return True
 
-    # 2. Антимат
     if chat.get("antiswear") and any(re.search(pat, text, re.I) for pat in PROFANITY_PATTERNS):
         try:
-            await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
-            await msg.answer(f"🤬 {await get_user_name(user_id)}, следите за выражениями (включён антимат).")
+            await bot.api.messages.delete(
+                peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True
+            )
+            await msg.answer(
+                f"🤬 {await get_user_name(user_id)}, следите за выражениями (включён антимат)."
+            )
         except Exception:
             pass
         return True
 
-    # 3. Антикапс
     letters = [c for c in text if c.isalpha()]
     if chat.get("anticaps") and len(letters) >= 8:
         upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
         if upper_ratio >= 0.75:
             try:
-                await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
+                await bot.api.messages.delete(
+                    peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True
+                )
                 await msg.answer(f"🔠 {await get_user_name(user_id)}, не капси в чате!")
             except Exception:
                 pass
             return True
 
-    # 4. Антифлуд и антиспам
     key = (peer_id, user_id)
     if chat.get("antiflood") and now - _last_msg_time.get(key, 0) < 1.2:
         try:
-            await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
+            await bot.api.messages.delete(
+                peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True
+            )
         except Exception:
             pass
         return True
     if chat.get("antispam") and len(text) >= 5 and _last_msg_text.get(key) == text.lower():
         try:
-            await bot.api.messages.delete(peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True)
+            await bot.api.messages.delete(
+                peer_id=peer_id, cmids=[msg.conversation_message_id], delete_for_all=True
+            )
         except Exception:
             pass
         return True
@@ -415,33 +446,31 @@ async def run_chat_guard(msg: Message) -> bool:
     return False
 
 
-# ==============================================================================
-# СПРАВОЧНИКИ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ==============================================================================
 HELP_TEXT = (
     "🤖 **GAMES | Чат Менеджер**\n\n"
     "🚨 **Защита беседы (работают с `/` и без `/`):**\n"
-    "• `/антиреклама [вкл|выкл]` (или `антиреклама`) — блок ссылок, инвайтов и рекламы\n"
-    "• `/антикапс [вкл|выкл]` (или `антикапс`) — блок КАПСА\n"
-    "• `/антиспам [вкл|выкл]` (или `антиспам`) — блок повторов сообщений\n"
-    "• `/антифлуд [вкл|выкл]` (или `антифлуд`) — блок частой отправки сообщений\n"
-    "• `/антимат [вкл|выкл]` (или `антимат`) — блок грубого мата\n"
-    "• `/антибот [вкл|выкл]` (или `антибот`) — автокик добавляемых ботов\n"
-    "• `/защита [модуль] [вкл|выкл]` и `защиты` — статус всех модулей\n\n"
+    "• `/антиреклама [вкл|выкл]` — блок ссылок, инвайтов и рекламы\n"
+    "• `/антикапс [вкл|выкл]` — блок КАПСА\n"
+    "• `/антиспам [вкл|выкл]` — блок повторов сообщений\n"
+    "• `/антифлуд [вкл|выкл]` — блок частой отправки сообщений\n"
+    "• `/антимат [вкл|выкл]` — блок грубого мата\n"
+    "• `/антибот [вкл|выкл]` — автокик добавляемых ботов\n"
+    "• `/защита [модуль] [вкл|выкл]` и `защиты` — статус всех модулей\n"
+    "• Автокик при выходе ПСЖ включён автоматически\n\n"
     "🛡 **Модерация (в беседах):**\n"
     "• `мут [юзер] [мин] [причина]` / `/мут ...` | `размут [юзер]` / `/размут ...`\n"
     "• `варн [юзер] [причина]` / `/варн ...` | `разварн [юзер]` / `/разварн ...`\n"
     "• `кик [юзер] [причина]` / `/кик ...` | `бан [юзер] [причина]` / `/бан ...` | `разбан [id]` / `/разбан ...`\n"
     "• `чистка [1-100]` / `/чистка ...` | `закреп` / `/закреп` (ответом)\n"
     "• `чат лок` / `чат анлок` | `приветствие [текст|выкл]`\n\n"
-    "👑 **Админка, ранги команд (/кмд) и репорты:**\n"
+    "👑 **Админка, ники (только админам), ранги команд (/кмд) и репорты:**\n"
+    "• `сник [юзер] [ник]` / `/сник ...` | `делник [юзер]` / `/делник ...` (только для админов)\n"
     "• `ранг [юзер] [0-100]` / `/ранг ...` | `стата [юзер]` / `/стата ...` | `админы` / `/админы`\n"
     "• `/кмд [команда] [ранг 0-100]` — поменять нужный ранг ЛЮБОЙ команды ТОЛЬКО в этой беседе (строго 100 lvl)\n"
     "• `/доступ [команда] [ранг]` — настройка прав для беседы (с 95+ lvl)\n"
     "• `аварн [юзер] [причина]` / `/аварн ...` | `снятьаварн [юзер]` / `/снятьаварн ...`\n"
     "• `репорт [текст]` / `/репорт ...` | `репорты` / `/репорты` | `ответ [ID] [текст]` / `/ответ ...`\n\n"
-    "📋 **Ники, лидеры, фан и утилиты:**\n"
-    "• `ник [новый_ник]` / `/ник ...` | `сник [юзер] [новый_ник]` / `/сник ...`\n"
+    "📋 **Лидеры, фан и утилиты:**\n"
     "• `лидер [фракция] [юзер]` / `/лидер ...` | `лидеры` / `/лидеры`\n"
     "• `заметка [имя] [текст]` | `заметки` | `удалзаметку [имя]`\n"
     "• `+реп` / `-реп` (ответом) | `топ` | `созыв [текст]`\n"
@@ -457,6 +486,7 @@ HELP_TEXT = (
 MOD_HELP_TEXT = (
     "🛡 **Команды модерации и защиты (в беседах):**\n"
     "• `/антиреклама вкл`, `/антикапс вкл`, `/антиспам вкл`, `/антифлуд вкл`, `/антимат вкл`, `/антибот вкл`\n"
+    "• `сник @юзер Ник` / `делник @юзер` (выдача и удаление ников — только для админов)\n"
     "• `мут @юзер 15 причина` | `размут @юзер` | `варн @юзер причина` | `разварн @юзер`\n"
     "• `кик @юзер причина` | `бан @юзер причина` | `разбан ID` | `чистка 20` | `закреп`\n"
     "• `чат лок` / `чат анлок` | `ранг @юзер 50`\n"
@@ -527,7 +557,8 @@ async def send_guard_status(msg: Message):
         f"• `/антиспам` (повторы): **{st('antispam')}**\n"
         f"• `/антифлуд` (частые сообщения): **{st('antiflood')}**\n"
         f"• `/антимат` (грубый мат): **{st('antiswear')}**\n"
-        f"• `/антибот` (автокик ботов при входе): **{st('antibot')}**\n\n"
+        f"• `/антибот` (автокик ботов при входе): **{st('antibot')}**\n"
+        f"• Автокик при выходе ПСЖ: **🟢 ВКЛ**\n\n"
         "Переключение: `/антиреклама вкл`, `/антикапс выкл` или `защита антиспам вкл`"
     )
 
@@ -584,9 +615,6 @@ async def send_db_dump(msg: Message):
             await asyncio.sleep(0.1)
 
 
-# ==============================================================================
-# ЕДИНЫЙ РОУТЕР СООБЩЕНИЙ И КНОПОК (С ИЛИ БЕЗ `/`)
-# ==============================================================================
 @bot.on.message()
 async def universal_message_router(msg: Message):
     if not msg.from_id:
@@ -701,7 +729,6 @@ async def universal_message_router(msg: Message):
         )
         return
 
-    # --- КОМАНДА /кмд (100 LVL, МЕНЯЕТ РАНГ ЛЮБОЙ КОМАНДЫ ТОЛЬКО В ЭТОЙ БЕСЕДЕ) ---
     if cmd in ("кмд", "кдм"):
         if not is_chat:
             await msg.answer("❌ Команда `/кмд` работает только внутри беседы.")
@@ -802,7 +829,9 @@ async def universal_message_router(msg: Message):
         )
         for oid in OWNER_IDS:
             try:
-                await bot.api.messages.send(peer_id=oid, message=alert, random_id=random.randint(1, 2**31 - 1))
+                await bot.api.messages.send(
+                    peer_id=oid, message=alert, random_id=random.randint(1, 2**31 - 1)
+                )
             except Exception:
                 pass
         return
@@ -872,13 +901,17 @@ async def universal_message_router(msg: Message):
         diff = now - int(econ.get("last_bonus", 0))
         if diff < cd:
             rem = cd - diff
-            await msg.answer(f"⏳ Бонус уже получен! Следующий через **{rem // 3600} ч. {(rem % 3600) // 60} мин.**")
+            await msg.answer(
+                f"⏳ Бонус уже получен! Следующий через **{rem // 3600} ч. {(rem % 3600) // 60} мин.**"
+            )
             return
         prize = random.randint(1500, 5000)
         econ["balance"] += prize
         econ["last_bonus"] = now
         save_db(db)
-        await msg.answer(f"🎁 Вы забрали ежедневный бонус: **+{fmt_num(prize)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
+        await msg.answer(
+            f"🎁 Вы забрали ежедневный бонус: **+{fmt_num(prize)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**"
+        )
         return
 
     if cmd == "работа":
@@ -899,7 +932,9 @@ async def universal_message_router(msg: Message):
         econ["balance"] += pay
         econ["last_work"] = now
         save_db(db)
-        await msg.answer(f"🛠 Вы {job_desc} и заработали **+{fmt_num(pay)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
+        await msg.answer(
+            f"🛠 Вы {job_desc} и заработали **+{fmt_num(pay)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**"
+        )
         return
 
     if cmd == "перевод":
@@ -1089,7 +1124,9 @@ async def universal_message_router(msg: Message):
         econ["balance"] += earned
         econ["last_collect"] = int(time.time())
         save_db(db)
-        await msg.answer(f"💰 Вы собрали прибыль с бизнесов: **+{fmt_num(earned)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
+        await msg.answer(
+            f"💰 Вы собрали прибыль с бизнесов: **+{fmt_num(earned)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**"
+        )
         return
 
     if cmd == "рассылка":
@@ -1145,47 +1182,6 @@ async def universal_message_router(msg: Message):
         await show_stats(msg, tid)
         return
 
-    if cmd == "ник":
-        if not is_chat:
-            await msg.answer("❌ Команда работает только в беседах.")
-            return
-        ok, req = has_cmd_access(peer_id, user_id, "ник")
-        if not ok:
-            await msg.answer(f"⛔ Команда `ник` доступна с **{req}+ lvl**.")
-            return
-        if not rest:
-            await msg.answer("❌ Укажите ник: `ник НовыйНик`")
-            return
-        clean_nick = rest[:32]
-        chat = get_chat(peer_id)
-        chat["nicks"][str(user_id)] = clean_nick
-        save_db(db)
-        await msg.answer(f"🏷 Ваш новый ник в этой беседе: **{clean_nick}**")
-        return
-
-    if cmd == "сник":
-        if not is_chat:
-            await msg.answer("❌ Команда работает только в беседах.")
-            return
-        ok, req = has_cmd_access(peer_id, user_id, "сник")
-        if not ok:
-            await msg.answer(f"⛔ Команда `сник` в этой беседе доступна с **{req}+ lvl**.")
-            return
-        tid = parse_target_id(msg, parts[1] if len(parts) > 1 else None)
-        if msg.reply_message and msg.reply_message.from_id:
-            tid = msg.reply_message.from_id
-            new_nick = rest
-        else:
-            new_nick = " ".join(parts[2:]).strip()
-        if not tid or not new_nick:
-            await msg.answer("❌ Использование: `сник @юзер НовыйНик` (или ответом `сник НовыйНик`)")
-            return
-        chat = get_chat(peer_id)
-        chat["nicks"][str(tid)] = new_nick[:32]
-        save_db(db)
-        await msg.answer(f"🏷 Игроку {await get_user_name(tid)} установлен ник: **{new_nick[:32]}**")
-        return
-
     if cmd == "брак":
         if not is_chat:
             await msg.answer("❌ Браки доступны только в беседах.")
@@ -1202,7 +1198,9 @@ async def universal_message_router(msg: Message):
         marriages[str(user_id)] = tid
         marriages[str(tid)] = user_id
         save_db(db)
-        await msg.answer(f"💍 Поздравляем! {await get_user_name(user_id)} и {await get_user_name(tid)} теперь в браке!")
+        await msg.answer(
+            f"💍 Поздравляем! {await get_user_name(user_id)} и {await get_user_name(tid)} теперь в браке!"
+        )
         return
 
     if cmd == "развод":
@@ -1216,7 +1214,9 @@ async def universal_message_router(msg: Message):
             return
         marriages.pop(str(spouse), None)
         save_db(db)
-        await msg.answer(f"💔 Брак между {await get_user_name(user_id)} и {await get_user_name(int(spouse))} расторгнут.")
+        await msg.answer(
+            f"💔 Брак между {await get_user_name(user_id)} и {await get_user_name(int(spouse))} расторгнут."
+        )
         return
 
     if cmd == "шар":
@@ -1250,7 +1250,9 @@ async def universal_message_router(msg: Message):
         cur = int(chat["rep"].get(str(tid), 0)) + delta
         chat["rep"][str(tid)] = cur
         save_db(db)
-        await msg.answer(f"{'👍' if delta > 0 else '👎'} Репутация {await get_user_name(tid)} изменена! Текущая: **{cur}**")
+        await msg.answer(
+            f"{'👍' if delta > 0 else '👎'} Репутация {await get_user_name(tid)} изменена! Текущая: **{cur}**"
+        )
         return
 
     if cmd == "топ":
@@ -1267,8 +1269,44 @@ async def universal_message_router(msg: Message):
         await msg.answer("\n".join(lines))
         return
 
-    # --- МОДЕРАЦИЯ И ЗАЩИТА В БЕСЕДАХ (С ИЛИ БЕЗ `/`) ---
     if not is_chat:
+        return
+
+    if cmd == "сник":
+        ok, req = has_cmd_access(peer_id, user_id, "сник")
+        if not ok:
+            await msg.answer(f"⛔ Команда `сник` доступна только администраторам (**{req}+ lvl**).")
+            return
+        if msg.reply_message and msg.reply_message.from_id:
+            tid = msg.reply_message.from_id
+            new_nick = rest
+        else:
+            tid = parse_target_id(msg, parts[1] if len(parts) > 1 else None)
+            new_nick = " ".join(parts[2:]).strip()
+        if not tid or not new_nick:
+            await msg.answer("❌ Использование: `сник @юзер НовыйНик` (или ответом `сник НовыйНик`)")
+            return
+        chat = get_chat(peer_id)
+        chat["nicks"][str(tid)] = new_nick[:32]
+        save_db(db)
+        await msg.answer(f"🏷 Игроку {await get_user_name(tid)} установлен ник: **{new_nick[:32]}**")
+        return
+
+    if cmd in ("делник", "снятьник", "удалник"):
+        ok, req = has_cmd_access(peer_id, user_id, "делник")
+        if not ok:
+            await msg.answer(f"⛔ Команда `делник` доступна только администраторам (**{req}+ lvl**).")
+            return
+        tid = parse_target_id(msg, parts[1] if len(parts) > 1 else None)
+        if not tid:
+            await msg.answer("❌ Использование: `делник @юзер` (или ответом на сообщение)")
+            return
+        chat = get_chat(peer_id)
+        if chat["nicks"].pop(str(tid), None) is not None:
+            save_db(db)
+            await msg.answer(f"🗑 Ник игрока {await get_user_name(tid)} удалён.")
+        else:
+            await msg.answer("❌ У этого игрока не был установлен ник в беседе.")
         return
 
     guard_cmd_map = {
@@ -1287,10 +1325,14 @@ async def universal_message_router(msg: Message):
             await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
             return
         chat = get_chat(peer_id)
-        new_state = parse_toggle_arg(parts[1] if len(parts) > 1 else None, bool(chat.get(prop_key, False)))
+        new_state = parse_toggle_arg(
+            parts[1] if len(parts) > 1 else None, bool(chat.get(prop_key, False))
+        )
         chat[prop_key] = new_state
         save_db(db)
-        await msg.answer(f"🚨 **{label_ru}** теперь **{'ВКЛЮЧЕН' if new_state else 'ВЫКЛЮЧЕН'}** в этой беседе.")
+        await msg.answer(
+            f"🚨 **{label_ru}** теперь **{'ВКЛЮЧЕН' if new_state else 'ВЫКЛЮЧЕН'}** в этой беседе."
+        )
         return
 
     if cmd in ("защиты", "статусзащиты"):
@@ -1316,14 +1358,20 @@ async def universal_message_router(msg: Message):
         }
         entry = mapping.get(parts[1].lower())
         if not entry:
-            await msg.answer("❌ Модули: `антиспам`, `антикапс`, `антифлуд`, `антиреклама`, `антимат`, `антибот`")
+            await msg.answer(
+                "❌ Модули: `антиспам`, `антикапс`, `антифлуд`, `антиреклама`, `антимат`, `антибот`"
+            )
             return
         key, label_ru = entry
         chat = get_chat(peer_id)
-        enabled = parse_toggle_arg(parts[2] if len(parts) > 2 else None, bool(chat.get(key, False)))
+        enabled = parse_toggle_arg(
+            parts[2] if len(parts) > 2 else None, bool(chat.get(key, False))
+        )
         chat[key] = enabled
         save_db(db)
-        await msg.answer(f"🛡 Модуль **{label_ru}** теперь **{'ВКЛЮЧЕН' if enabled else 'ВЫКЛЮЧЕН'}**.")
+        await msg.answer(
+            f"🛡 Модуль **{label_ru}** теперь **{'ВКЛЮЧЕН' if enabled else 'ВЫКЛЮЧЕН'}**."
+        )
         return
 
     if cmd == "ранг":
@@ -1387,11 +1435,15 @@ async def universal_message_router(msg: Message):
             chat["admin_warns"][str(tid)] = 0
             chat["ranks"][str(tid)] = 0
             save_db(db)
-            await msg.answer(f"🔻 Администратор {await get_user_name(tid)} получил **3/3 выговора** и был снят с поста!")
+            await msg.answer(
+                f"🔻 Администратор {await get_user_name(tid)} получил **3/3 выговора** и был снят с поста!"
+            )
         else:
             chat["admin_warns"][str(tid)] = aw
             save_db(db)
-            await msg.answer(f"📛 Администратору {await get_user_name(tid)} выдан выговор (**{aw}/3**).\nПричина: {reason}")
+            await msg.answer(
+                f"📛 Администратору {await get_user_name(tid)} выдан выговор (**{aw}/3**).\nПричина: {reason}"
+            )
         return
 
     if cmd == "снятьаварн":
@@ -1430,7 +1482,9 @@ async def universal_message_router(msg: Message):
         chat = get_chat(peer_id)
         chat["mutes"][str(tid)] = time.time() + mins * 60
         save_db(db)
-        await msg.answer(f"🔇 {await get_user_name(tid)} получил мут на **{mins} мин.**\nПричина: {reason}")
+        await msg.answer(
+            f"🔇 {await get_user_name(tid)} получил мут на **{mins} мин.**\nПричина: {reason}"
+        )
         return
 
     if cmd == "размут":
@@ -1468,14 +1522,20 @@ async def universal_message_router(msg: Message):
             chat["warns"][str(tid)] = 0
             save_db(db)
             try:
-                await bot.api.messages.remove_chat_user(chat_id=peer_id - 2000000000, member_id=tid)
+                await bot.api.messages.remove_chat_user(
+                    chat_id=peer_id - 2000000000, member_id=tid
+                )
                 await msg.answer(f"⛔ {await get_user_name(tid)} получил **3/3 варна** и был исключён!")
             except Exception:
-                await msg.answer(f"⚠️ {await get_user_name(tid)} набрал **3/3 варна**, но у бота нет прав кикнуть его.")
+                await msg.answer(
+                    f"⚠️ {await get_user_name(tid)} набрал **3/3 варна**, но у бота нет прав кикнуть его."
+                )
         else:
             chat["warns"][str(tid)] = w
             save_db(db)
-            await msg.answer(f"⚠️ {await get_user_name(tid)} выдано предупреждение (**{w}/3**).\nПричина: {reason}")
+            await msg.answer(
+                f"⚠️ {await get_user_name(tid)} выдано предупреждение (**{w}/3**).\nПричина: {reason}"
+            )
         return
 
     if cmd == "разварн":
@@ -1561,7 +1621,9 @@ async def universal_message_router(msg: Message):
             await msg.answer("❌ Формат: `чистка 20`")
             return
         cnt = min(max(1, int(parts[1])), 100)
-        cmids = list(range(max(1, msg.conversation_message_id - cnt), msg.conversation_message_id + 1))
+        cmids = list(
+            range(max(1, msg.conversation_message_id - cnt), msg.conversation_message_id + 1)
+        )
         try:
             await bot.api.messages.delete(peer_id=peer_id, cmids=cmids, delete_for_all=True)
             await msg.answer(f"🧹 Очищено последних сообщений: **{cnt}**")
@@ -1578,7 +1640,9 @@ async def universal_message_router(msg: Message):
             await msg.answer("❌ Ответьте командой `закреп` на сообщение.")
             return
         try:
-            await bot.api.messages.pin(peer_id=peer_id, conversation_message_id=msg.reply_message.conversation_message_id)
+            await bot.api.messages.pin(
+                peer_id=peer_id, conversation_message_id=msg.reply_message.conversation_message_id
+            )
             await msg.answer("📌 Сообщение закреплено!")
         except Exception as e:
             await msg.answer(f"❌ Ошибка закрепления: `{e}`")
@@ -1593,7 +1657,9 @@ async def universal_message_router(msg: Message):
         lock = parts[1].lower() == "лок"
         chat["locked"] = lock
         save_db(db)
-        await msg.answer("🔒 Чат закрыт для обычных участников." if lock else "🔓 Чат снова открыт для всех!")
+        await msg.answer(
+            "🔒 Чат закрыт для обычных участников." if lock else "🔓 Чат снова открыт для всех!"
+        )
         return
 
     if cmd == "приветствие":
@@ -1609,7 +1675,9 @@ async def universal_message_router(msg: Message):
         else:
             chat["welcome"] = rest
             save_db(db)
-            await msg.answer("✅ Приветствие сохранено! Используйте `{user}` для упоминания новичка.")
+            await msg.answer(
+                "✅ Приветствие сохранено! Используйте `{user}` для упоминания новичка."
+            )
         return
 
     if cmd == "лидер":
@@ -1695,7 +1763,9 @@ async def universal_message_router(msg: Message):
             mentions = [f"[id{m.member_id}|📣]" for m in members.items if m.member_id > 0]
             await msg.answer(f"📢 **СОЗЫВ БЕСЕДЫ:** {reason}\n" + " ".join(mentions[:60]))
         except Exception as e:
-            await msg.answer(f"❌ Не удалось получить список участников (нужна админка боту): `{e}`")
+            await msg.answer(
+                f"❌ Не удалось получить список участников (нужна админка боту): `{e}`"
+            )
         return
 
 
