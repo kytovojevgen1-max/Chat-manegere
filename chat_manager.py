@@ -15,7 +15,7 @@ from vkbottle.bot import Bot, Message
 # ==============================================================================
 TOKEN = os.getenv(
     "VK_TOKEN",
-    "vk1.a.gZ8p6p0tT8k8S3iX6Q8l6R_nK4n3O2M1L0K9J8H7G6F5D4S3A2P1O0I9U8Y7T6R5E4W3Q2"
+    "vk1.a.5BfnzsvcbvRGCC9ZGxmbKdzOU-0NBWIPc9RovnKuIImAHcV46i4wMJUGvrkua3xKhDqo57KVoiXQOqhuctwA93--pk54OWAy_rfzgGfTTQFdG1vFzRObXKPTikSt3h1rRR6ImqGbPMaOgAC3vLaPxx359f9T4N2nl2d4dZGFInNv4F9LLsctf3GiuJfrBkqBcji79CiXrPLqeClPoXaptg"
 )
 OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "897082738").split(",") if x.strip().isdigit()}
 DB_FILE = os.getenv("DB_FILE", "games_chat_manager_db.json")
