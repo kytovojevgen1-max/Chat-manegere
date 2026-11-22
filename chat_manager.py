@@ -13,6 +13,7 @@ import aiohttp
 from flask import Flask, jsonify
 from vkbottle import Bot, Keyboard, KeyboardButtonColor, Text
 from vkbottle.bot import Message
+from vkbottle.tools import DocUploader
 
 # =====================================================================
 # 1. КОНФИГУРАЦИЯ И ИНИЦИАЛИЗАЦИЯ
@@ -49,13 +50,12 @@ DEFAULT_ROLES = {
 }
 
 MAX_ACTIVE_POOL_CHATS = 1000
-MAX_CHATS_PER_CODE = 999999  # 1 код = бесконечное число чатов (50+ и более)
-
 BONUS_MIN = 1_000_000
 BONUS_MAX = 50_000_000
-BONUS_COOLDOWN = 86400  # 24 часа
+BONUS_COOLDOWN = 0  # без ожидания 24ч
 
 bot = Bot(token=TOKEN)
+doc_uploader = DocUploader(bot.api)
 
 # =====================================================================
 # FLASK HEALTH SERVER ДЛЯ RENDER / UPTIMEROBOT
@@ -92,13 +92,13 @@ def default_db() -> dict:
         "leaders": {},
         "reports": [],
         "logs": [],
-        "chat_messages_log": [],     # что писали в чатах: {"ts": str, "peer_id": int, "uid": int, "text": str}
-        "bot_interactions_log": [],  # что писали к боту / команды: {"ts": str, "peer_id": int, "uid": int, "text": str}
+        "chat_messages_log": [],
+        "bot_interactions_log": [],
         "broadcast_admins": [],
         "pool_codes": {},
-        "economy": {},               # str(uid): {"coins": int, "vip_until": int, "last_bonus": int, "wins": int, "games": int}
-        "pending_bans": {},          # token: {"admin_id": int, "target_id": int, "peer_id": int, "created_at": int}
-        "pending_duels": {},         # token: {"challenger_id": int, "target_id": int, "bet": int, "peer_id": int, "created_at": int}
+        "economy": {},
+        "pending_bans": {},
+        "pending_duels": {},
     }
 
 
@@ -131,6 +131,8 @@ def save_db(data: dict) -> None:
 
 
 db = load_db()
+save_db(db)
+
 user_states: dict[int, str] = {}
 user_cache: dict[int, dict] = {}
 flood_tracker: dict[tuple[int, int], list[float]] = {}
@@ -285,12 +287,8 @@ def format_duration_ru(seconds: int) -> str:
 
 
 def parse_vip_seconds(raw: str) -> Optional[int]:
-    """
-    Срок VIP от 1 дня до 10 лет (1..3650 дней).
-    Примеры: 1д, 30д, 1год, 10лет, 365d, 10y, 180
-    """
     s = raw.strip().lower().replace(",", ".")
-    max_days = 10 * 365  # 10 лет
+    max_days = 10 * 365
     if s.isdigit():
         days = int(s)
     else:
@@ -488,26 +486,27 @@ def get_user_level_by_id(uid: int, chat_data: dict, owner_id: int | None = None)
 # =====================================================================
 # 4. БЭКАП / СКАЧИВАНИЕ / ЗАГРУЗКА БД И МОНИТОРИНГ ЧАТОВ (ВЛАДЕЛЕЦ)
 # =====================================================================
-async def send_db_file(target_peer_id: int, caption: str = "💾 Актуальная база данных (`bot_database.json`):") -> bool:
+async def send_db_file(target_peer_id: int, caption: str = "💾 База данных bot_database.json") -> Tuple[bool, str]:
     save_db(db)
     if not os.path.exists(DB_FILE):
-        return False
+        return False, "Файл БД не найден."
     try:
-        doc = await bot.api.doc_upload.upload(
+        attachment = await doc_uploader.upload(
             file_source=DB_FILE,
-            peer_id=target_peer_id,
-            title=os.path.basename(DB_FILE),
+            peer_id=int(target_peer_id),
+            title="bot_database.json",
         )
         await bot.api.messages.send(
-            peer_id=target_peer_id,
+            peer_id=int(target_peer_id),
             message=caption,
-            attachment=doc,
-            random_id=0,
+            attachment=attachment,
+            random_id=random.randint(1, 2_000_000_000),
         )
-        return True
+        return True, "ok"
     except Exception as e:
-        print(f"[DB SEND ERROR] {e}")
-        return False
+        err_msg = f"Ошибка отправки файла ВК: {e}"
+        print(f"[DB SEND ERROR] {err_msg}")
+        return False, err_msg
 
 
 async def restore_db_from_message(message: Message) -> Tuple[bool, str]:
@@ -602,7 +601,7 @@ def build_welcome_guide(chat_data: dict) -> str:
     proj_name = chat_data.get("project_name", DEFAULT_PROJECT_NAME)
     return (
         f"👋 ═══ {proj_name} — БОТ ПОДКЛЮЧЁН ═══ 👋\n\n"
-        "• Команды и игры: `/help` | Кнопки: `/menu`\n"
+        "• Справка: `/хелп` или `/help` | Кнопки: `/меню`\n"
         "• Бесконечный ключ (`1 код = ∞ чатов`): `/код [КЛЮЧ]`\n"
         "• Бонус `1 000 000 – 50 000 000`: `/бонус` | Игры: `/монетка`, `/кубик`, `/слоты`, `/рулетка`, `/дуэль`\n"
         "• Бан кнопками (`1–360` дней): `/бан @юзер` или реплаем `/бан`\n"
@@ -623,7 +622,7 @@ async def run_global_broadcast(sender_id: int, raw_body: str) -> int:
     targets = set(int(x) for x in db.get("global_chats", [])) | set(int(x) for x in db.get("chats", {}).keys())
     for cid in targets:
         try:
-            await bot.api.messages.send(peer_id=int(cid), message=broadcast_text, random_id=0)
+            await bot.api.messages.send(peer_id=int(cid), message=broadcast_text, random_id=random.randint(1, 2_000_000_000))
             count += 1
         except Exception:
             pass
@@ -824,7 +823,6 @@ async def private_handler(message: Message):
     if text:
         record_bot_interaction(uid, uid, text)
 
-    # Загрузка БД файлом
     if (state == "wait_upload_db" or low.startswith(("/загрузитьбд", "/loaddb", "/восстановитьбд"))) and is_main:
         if message.attachments or (message.reply_message and message.reply_message.attachments):
             user_states.pop(uid, None)
@@ -846,9 +844,9 @@ async def private_handler(message: Message):
         user_states.pop(uid, None)
         await message.answer(
             f"👑 ═══ {DEFAULT_PROJECT_NAME} — ПАНЕЛЬ ВЛАДЕЛЬЦА ═══ 👑\n\n"
-            f"• Бесконечные коды: `1 код = ∞ чатов` (активных чатов: `{count_active_pool_chats()}`).\n"
-            "• БД (только владельцу): `/скачатьбд`, `/бэкап`, `/загрузитьбд`.\n"
-            "• Мониторинг (только владельцу): `/чатылог`, `/взаимодействия`.",
+            f"• Бесконечные коды: `1 код = ∞ чатов` (активных чатов: `{count_active_pool_chats()}`)\n"
+            "• БД (только владельцу): `/скачатьбд`, `/бэкап`, `/загрузитьбд`\n"
+            "• Мониторинг (только владельцу): `/чатылог`, `/взаимодействия`",
             keyboard=get_private_keyboard(uid),
         )
         return
@@ -857,9 +855,9 @@ async def private_handler(message: Message):
         if not is_main:
             await message.answer("❌ Команда доступна только владельцу бота.")
             return
-        ok = await send_db_file(uid, caption="💾 Файл базы данных `bot_database.json` выгружен владельцу бота:")
+        ok, info_err = await send_db_file(uid, caption="💾 База данных bot_database.json")
         if not ok:
-            await message.answer("❌ Не удалось отправить файл базы данных.", keyboard=get_private_keyboard(uid))
+            await message.answer(f"❌ {info_err}", keyboard=get_private_keyboard(uid))
         return
 
     if text == "📤 Загрузить БД":
@@ -1071,7 +1069,7 @@ async def private_handler(message: Message):
 
 
 # =====================================================================
-# 8. РАБОТА В БЕСЕДАХ (ТВОЙ ОСНОВНОЙ ФУНКЦИОНАЛ + НОВЫЕ СИСТЕМЫ)
+# 8. РАБОТА В БЕСЕДАХ
 # =====================================================================
 @bot.on.chat_message()
 async def chat_handler(message: Message):
@@ -1139,11 +1137,9 @@ async def chat_handler(message: Message):
             del chat_data["mutes"][uid_str]
             save_db(db)
 
-    text = message.text
-    raw_text = (text or "").strip()
+    raw_text = (message.text or "").strip()
     is_main_owner = is_bot_owner(uid_int)
 
-    # Загрузка БД файлом в чате (только владелец бота)
     if is_main_owner and raw_text.lower().startswith(("/загрузитьбд", "/loaddb", "/восстановитьбд")):
         _, res_txt = await restore_db_from_message(message)
         return await message.answer(res_txt)
@@ -1244,19 +1240,25 @@ async def chat_handler(message: Message):
     # --- Кнопки и быстрые фразы ---
     quick_buttons = {
         "🎁 бонус": "/бонус",
-        "📊 стата": "/stats",
+        "📊 стата": "/стата",
         "🏆 топ": "/топ",
         "🪙 монетка": "/монетка 100000 орёл",
         "🎲 кубик": "/кубик 100000 6",
         "🎰 слоты": "/слоты 100000",
         "🎡 рулетка": "/рулетка 100000 красное",
         "💼 работа": "/работа",
+        "👑 админы": "/админс",
+        "📜 правила": "/правила",
+        "📖 команды": "/хелп",
+        "хелп": "/хелп",
+        "help": "/хелп",
+        "команды": "/хелп",
     }
     if clean_text in quick_buttons:
-        clean_text = quick_buttons[clean_text]
         raw_text = quick_buttons[clean_text]
+        clean_text = raw_text.lower()
 
-    if clean_text in ["/menu", "/panel", "/панель", "меню", "панель"]:
+    if clean_text in ["/menu", "/panel", "/панель", "/меню", "меню", "панель"]:
         return await message.answer(f"👑 ═══ ПАНЕЛЬ УПРАВЛЕНИЯ — {proj_name} ═══ 👑", keyboard=get_chat_inline_keyboard())
 
     if clean_text in ["🔑 код пула", "код пула"]:
@@ -1286,7 +1288,7 @@ async def chat_handler(message: Message):
     if clean_text in ["🌐 ссылка", "🌐 сайт", "ссылка", "сайт", "/link", "/ссылка"]:
         return await message.answer(f"🌐 Ссылка проекта **{proj_name}**: {proj_url}", keyboard=get_chat_inline_keyboard())
 
-    if clean_text in ["📜 правила", "правила", "/rules", "/правила"]:
+    if clean_text in ["правила", "/rules", "/правила"]:
         return await message.answer(chat_data.get("rules_text", DEFAULT_RULES), keyboard=get_chat_inline_keyboard())
 
     if clean_text in ["🛠 модерация", "модерация"]:
@@ -1312,18 +1314,6 @@ async def chat_handler(message: Message):
             r_list += f"• `{lvl} lvl` ➔ **{title}**\n"
         return await message.answer(r_list, keyboard=get_chat_inline_keyboard())
 
-    if clean_text in ["👑 админы", "/admins", "/админс", "админы", "админс"]:
-        clean_text = "/admins"
-        raw_text = "/admins"
-
-    if clean_text in ["📊 стата", "/stats", "/стата", "/профиль", "стата"]:
-        clean_text = "/stats"
-        raw_text = "/stats"
-
-    if clean_text in ["📖 команды", "/help", "/хелп", "команды", "хелп"]:
-        clean_text = "/help"
-        raw_text = "/help"
-
     if not clean_text.startswith("/"):
         return
 
@@ -1334,13 +1324,21 @@ async def chat_handler(message: Message):
     params = args[1:] if len(args) > 1 else []
 
     # =================================================================
+    # СПРАВКА (/хелп, /help, /помощь, /команды)
+    # =================================================================
+    if cmd in ["хелп", "help", "помощь", "cmds", "команды"]:
+        return await message.answer(build_full_help_with_ranks(proj_name), keyboard=get_chat_inline_keyboard())
+
+    # =================================================================
     # КОМАНДЫ ВЛАДЕЛЬЦА БОТА: СКАЧАТЬ БД И МОНИТОРИНГ ЧАТОВ/БОТА
     # =================================================================
     if cmd in ("скачатьбд", "downloaddb", "бэкап", "backup"):
         if not is_main_owner:
             return await message.answer("❌ Скачивать и делать бэкап БД может только владелец бота.")
-        ok = await send_db_file(uid_int, caption=f"💾 База данных `bot_database.json` из чата `{peer_id}`:")
-        return await message.answer("📩 Файл базы данных отправлен тебе в ЛС." if ok else "❌ Ошибка отправки файла БД.")
+        ok, info_err = await send_db_file(uid_int, caption=f"💾 База данных bot_database.json (из чата {peer_id})")
+        if ok:
+            return await message.answer("📩 Файл `bot_database.json` отправлен тебе в личные сообщения!")
+        return await message.answer(f"❌ Не удалось отправить файл БД: `{info_err}`")
 
     elif cmd in ("чатылог", "взаимодействия"):
         if not is_main_owner:
@@ -1360,17 +1358,12 @@ async def chat_handler(message: Message):
     elif cmd in ("бонус", "bonus"):
         econ = get_econ(uid_int)
         vip_ok, _ = is_vip_active(uid_int)
-        cd = BONUS_COOLDOWN // 2 if vip_ok else BONUS_COOLDOWN
-        now_s = int(time.time())
-        if not is_main_owner and (now_s - int(econ.get("last_bonus", 0))) < cd:
-            left = cd - (now_s - int(econ.get("last_bonus", 0)))
-            return await message.answer(f"⏳ Бонус уже получен! Повторно через `{format_duration_ru(left)}`.")
         gain = random.randint(BONUS_MIN, BONUS_MAX)
         if vip_ok:
             gain *= 2
         with DB_LOCK:
             econ["coins"] = int(econ.get("coins", 0)) + gain
-            econ["last_bonus"] = now_s
+            econ["last_bonus"] = int(time.time())
             save_db(db)
         return await message.answer(
             f"🎁 **Бонус получен!**\n"
@@ -1648,9 +1641,6 @@ async def chat_handler(message: Message):
         st = "🟢 ВКЛЮЧЁН" if chat_data["pools"]["nick_roles"] else "🔴 ВЫКЛЮЧЕН"
         return await message.answer(f"🎭 Отдельный пул «Ники и роли» в этой беседе: {st}.")
 
-    elif cmd in ["help", "хелп", "cmds", "команды"]:
-        return await message.answer(build_full_help_with_ranks(proj_name), keyboard=get_chat_inline_keyboard())
-
     # =================================================================
     # УТИЛИТЫ, РЕПУТАЦИЯ, ЗАМЕТКИ, СОЗЫВ, ВЫДАЧА ВЛАДЕЛЬЦА
     # =================================================================
@@ -1863,7 +1853,7 @@ async def chat_handler(message: Message):
                 await bot.api.messages.send(
                     peer_id=int(owner_id),
                     message=f"📩 **РЕПОРТ #{rep_id}** в **{chat_title}** от {await format_vk_user(uid_int)}:\n{rep_text}",
-                    random_id=0,
+                    random_id=random.randint(1, 2_000_000_000),
                 )
             except Exception:
                 pass
@@ -2574,7 +2564,7 @@ async def chat_handler(message: Message):
         sent = 0
         for cid in db.get("global_chats", []):
             try:
-                await bot.api.messages.send(peer_id=int(cid), message=f"🌍📣 **СЕТЕВОЙ СОЗЫВ**: **{msg_call}**\n\n@all", random_id=0)
+                await bot.api.messages.send(peer_id=int(cid), message=f"🌍📣 **СЕТЕВОЙ СОЗЫВ**: **{msg_call}**\n\n@all", random_id=random.randint(1, 2_000_000_000))
                 sent += 1
             except Exception:
                 pass
