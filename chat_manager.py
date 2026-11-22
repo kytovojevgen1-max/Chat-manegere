@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiohttp import web
-from vkbottle import BaseStateGroup, CtxStorage, Keyboard, KeyboardButtonColor, Text
+from vkbottle import CtxStorage, Keyboard, KeyboardButtonColor, Text
 from vkbottle.bot import Bot, Message
 
 # ==============================================================================
@@ -17,7 +17,7 @@ TOKEN = os.getenv(
     "VK_TOKEN",
     "vk1.a.gZ8p6p0tT8k8S3iX6Q8l6R_nK4n3O2M1L0K9J8H7G6F5D4S3A2P1O0I9U8Y7T6R5E4W3Q2"
 )
-OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "849422585").split(",") if x.strip().isdigit()}
+OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "897082738").split(",") if x.strip().isdigit()}
 DB_FILE = os.getenv("DB_FILE", "games_chat_manager_db.json")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -28,11 +28,38 @@ ctx = CtxStorage()
 # БАЗА ДАННЫХ (АТОМАРНОЕ СОХРАНЕНИЕ)
 # ==============================================================================
 DEFAULT_DB: Dict[str, Any] = {
-    "chats": {},          # peer_id -> settings, users, warns, mutes, bans, reps, notes, leaders
+    "chats": {},          # peer_id -> settings, ranks, cmd_ranks, warns, admin_warns, mutes, bans, rep, notes, leaders, nicks, marriage, welcome
     "global_admins": {},  # user_id -> rank (0..100)
-    "reports": [],        # list of dicts {id, peer_id, user_id, text, status, answer, answered_by, ts}
-    "economy": {},        # user_id -> {balance, bank, last_bonus, last_work, businesses: {biz_id: level}, last_collect}
-    "vip_users": [],      # list of user_ids
+    "reports": [],        # list of dicts
+    "economy": {},        # user_id -> {balance, bank, last_bonus, last_work, businesses, last_collect}
+}
+
+# Стандартные минимальные ранги для команд (можно менять отдельно для каждой беседы через /доступ)
+DEFAULT_CMD_RANKS: Dict[str, int] = {
+    "ник": 0,          # сменить свой ник
+    "сник": 15,        # сменить ник другому игроку
+    "мут": 30,
+    "размут": 30,
+    "варн": 40,
+    "разварн": 40,
+    "закреп": 40,
+    "заметка": 40,
+    "удалзаметку": 40,
+    "кик": 50,
+    "чистка": 50,
+    "созыв": 50,
+    "репорты": 50,
+    "ответ": 50,
+    "бан": 60,
+    "разбан": 60,
+    "чатлок": 60,
+    "защита": 60,
+    "лидер": 60,
+    "приветствие": 60,
+    "аварн": 75,
+    "снятьаварн": 75,
+    "ранг": 80,
+    "доступ": 95,      # настройка рангов команд в конкретной беседе
 }
 
 BUSINESS_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -78,18 +105,30 @@ def get_chat(peer_id: int) -> Dict[str, Any]:
             "anticaps": False,
             "antiflood": False,
             "antilink": False,
-            "ranks": {},       # user_id -> rank (0..100)
-            "warns": {},       # user_id -> count
-            "admin_warns": {}, # user_id -> count
-            "mutes": {},       # user_id -> until_ts
-            "bans": {},        # user_id -> reason
-            "rep": {},         # user_id -> int
-            "notes": {},       # name -> text
-            "leaders": {},     # faction -> user_id
-            "nicks": {},       # user_id -> nick
+            "welcome": "",
+            "ranks": {},
+            "cmd_ranks": {},
+            "warns": {},
+            "admin_warns": {},
+            "mutes": {},
+            "bans": {},
+            "rep": {},
+            "notes": {},
+            "leaders": {},
+            "nicks": {},
+            "marriages": {},
         }
         save_db(db)
-    return db["chats"][pid]
+    chat = db["chats"][pid]
+    for k, v in [
+        ("cmd_ranks", {}),
+        ("admin_warns", {}),
+        ("marriages", {}),
+        ("welcome", ""),
+    ]:
+        if k not in chat:
+            chat[k] = v
+    return chat
 
 
 def get_econ(user_id: int) -> Dict[str, Any]:
@@ -120,6 +159,21 @@ def get_rank(peer_id: int, user_id: int) -> int:
         chat = get_chat(peer_id)
         c_rank = int(chat["ranks"].get(str(user_id), 0))
     return max(g_rank, c_rank)
+
+
+def get_req_rank(peer_id: int, cmd_key: str) -> int:
+    default_lvl = DEFAULT_CMD_RANKS.get(cmd_key, 0)
+    if peer_id > 2000000000:
+        chat = get_chat(peer_id)
+        if cmd_key in chat.get("cmd_ranks", {}):
+            return int(chat["cmd_ranks"][cmd_key])
+    return default_lvl
+
+
+def has_cmd_access(peer_id: int, user_id: int, cmd_key: str) -> Tuple[bool, int]:
+    req = get_req_rank(peer_id, cmd_key)
+    cur = get_rank(peer_id, user_id)
+    return (cur >= req), req
 
 
 async def get_user_name(user_id: int) -> str:
@@ -154,7 +208,7 @@ def fmt_num(n: int) -> str:
 
 
 # ==============================================================================
-# АВТОМОДЕРАЦИЯ В БЕСЕДАХ
+# АВТОМОДЕРАЦИЯ И ПРИВЕТСТВИЯ В БЕСЕДАХ
 # ==============================================================================
 _last_msg_time: Dict[Tuple[int, int], float] = {}
 _last_msg_text: Dict[Tuple[int, int], str] = {}
@@ -167,6 +221,22 @@ async def chat_guard(msg: Message):
     peer_id = msg.peer_id
     user_id = msg.from_id
     chat = get_chat(peer_id)
+
+    # Системное событие входа нового участника
+    if msg.action and msg.action.type.value in ("chat_invite_user", "chat_invite_user_by_link"):
+        invited_id = msg.action.member_id or user_id
+        if str(invited_id) in chat.get("bans", {}):
+            try:
+                await bot.api.messages.remove_chat_user(chat_id=peer_id - 2000000000, member_id=invited_id)
+                await msg.answer(f"🔨 {await get_user_name(invited_id)} находится в бане этой беседы и был исключён.")
+            except Exception:
+                pass
+            return
+        if chat.get("welcome"):
+            w_text = chat["welcome"].replace("{user}", await get_user_name(invited_id))
+            await msg.answer(w_text)
+        return
+
     if chat.get("title") == f"Чат {peer_id}":
         try:
             conv = await bot.api.messages.get_conversations_by_id(peer_ids=[peer_id])
@@ -246,41 +316,35 @@ async def chat_guard(msg: Message):
 # ==============================================================================
 # ПОМОЩЬ И ПАНЕЛЬ
 # ==============================================================================
-HELP_TEXT = """🤖 **GAMES | Чат Менеджер**
-
-🛡 **Модерация (в беседах):**
-• `/мут [юзер] [мин] [причина]` | `/размут [юзер]`
-• `/варн [юзер] [причина]` | `/разварн [юзер]`
-• `/кик [юзер] [причина]` | `/бан [юзер] [причина]` | `/разбан [id]`
-• `/чистка [1-100]` | `/закреп` (ответом)
-• `/чат лок` | `/чат анлок`
-• `/защита [антиспам|антикапс|антифлуд|антиреклама] [вкл|выкл]`
-
-👑 **Админка, ранги и репорты:**
-• `/ранг [юзер] [0-100]` | `/стата [юзер]` | `/админы`
-• `/аварн [юзер] [причина]` | `/снятьаварн [юзер]`
-• `/репорт [текст]` — отправить жалобу/вопрос админам
-• `/репорты` — список открытых репортов
-• `/ответ [ID] [текст]` — ответить из ЛЮБОЙ беседы (ответ прилетит игроку в ту беседу, откуда он писал!)
-
-📋 **Чат-утилиты:**
-• `/ник [юзер] [ник]` | `/лидер [фракция] [юзер]` | `/лидеры`
-• `/заметка [имя] [текст]` | `/заметки` | `/удалзаметку [имя]`
-• `+реп` / `-реп` (ответом на сообщение) | `/топ`
-• `/созыв [текст]` — позвать активных участников беседы
-
-🎰 **Игры, казино и бизнесы:**
-• `/баланс` (`/б`) | `/бонус` | `/работа` | `/перевод [юзер] [сумма]`
-• `/казино [ставка]` (`/каз`) — шанс x2 / x5 / 0
-• `/колесо [ставка]` — Колесо Фортуны (множители от 0x до 10x)
-• `/кубик [ставка]` — дуэль костей против бота
-• `/слоты [ставка]` — игровые автоматы 🍒🍋💎7️⃣
-• `/бизнесы` — магазин бизнесов | `/купитьбиз [номер]` | `/мойбиз` | `/собрать`
-
-⚙️ **Владелец бота:**
-• `/рассылка [текст]` — рассылка по всем беседам (ТОЛЬКО владелец)
-• `/скачатьбд` — дамп и сводка базы данных
-• `/выдатьденьги [юзер] [сумма]`"""
+HELP_TEXT = (
+    "🤖 **GAMES | Чат Менеджер**\n\n"
+    "🛡 **Модерация (в беседах):**\n"
+    "• `/мут [юзер] [мин] [причина]` | `/размут [юзер]`\n"
+    "• `/варн [юзер] [причина]` | `/разварн [юзер]`\n"
+    "• `/кик [юзер] [причина]` | `/бан [юзер] [причина]` | `/разбан [id]`\n"
+    "• `/чистка [1-100]` | `/закреп` (ответом)\n"
+    "• `/чат лок` | `/чат анлок` | `/приветствие [текст|выкл]`\n"
+    "• `/защита [антиспам|антикапс|антифлуд|антиреклама] [вкл|выкл]`\n\n"
+    "👑 **Админка, права команд и репорты:**\n"
+    "• `/ранг [юзер] [0-100]` | `/стата [юзер]` | `/админы`\n"
+    "• `/доступ [команда] [ранг]` — настроить нужный ранг команды для ЭТОЙ беседы (от 95+ lvl)\n"
+    "• `/доступы` — посмотреть текущие ранги команд в этой беседе\n"
+    "• `/аварн [юзер] [причина]` | `/снятьаварн [юзер]`\n"
+    "• `/репорт [текст]` | `/репорты` | `/ответ [ID] [текст]`\n\n"
+    "📋 **Ники, лидеры, фан и утилиты:**\n"
+    "• `/ник [новый_ник]` — поменять свой ник\n"
+    "• `/сник [юзер] [новый_ник]` — сменить ник другому (по стандарту с 15 lvl)\n"
+    "• `/лидер [фракция] [юзер]` | `/лидеры`\n"
+    "• `/заметка [имя] [текст]` | `/заметки` | `/удалзаметку [имя]`\n"
+    "• `+реп` / `-реп` (ответом) | `/топ` | `/созыв [текст]`\n"
+    "• `/брак [юзер]` | `/развод` | `/шар [вопрос]` | `/выбор [А или Б]`\n\n"
+    "🎰 **Игры, казино и бизнесы:**\n"
+    "• `/баланс` (`/б`) | `/бонус` | `/работа` | `/перевод [юзер] [сумма]`\n"
+    "• `/казино [ставка]` | `/колесо [ставка]` | `/слоты [ставка]` | `/кубик [ставка]`\n"
+    "• `/бизнесы` | `/купитьбиз [номер]` | `/мойбиз` | `/собрать`\n\n"
+    "⚙️ **Владелец бота:**\n"
+    "• `/рассылка [текст]` | `/скачатьбд` | `/выдатьденьги [юзер] [сумма]`"
+)
 
 
 @bot.on.message(text=["/помощь", "помощь", "/help", "/хелп", "/команды", "команды"])
@@ -300,8 +364,7 @@ async def cmd_panel(msg: Message):
     )
     if is_owner(msg.from_id):
         kb.row().add(Text("💾 Скачать БД", {"cmd": "dump_db"}), color=KeyboardButtonColor.NEGATIVE)
-    await msg.answer("⚙️ **Панель управления GAMES | Чат Менеджер**
-Выберите нужный раздел:", keyboard=kb)
+    await msg.answer("⚙️ **Панель управления GAMES | Чат Менеджер**\nВыберите нужный раздел:", keyboard=kb)
 
 
 @bot.on.message(payload={"cmd": "help"})
@@ -313,23 +376,14 @@ async def btn_help(msg: Message):
 async def btn_games(msg: Message):
     econ = get_econ(msg.from_id)
     await msg.answer(
-        f"🎮 **Игровой центр**
-"
-        f"💰 Ваш баланс: **{fmt_num(econ['balance'])} $**
-
-"
-        f"• `/бонус` — ежедневная награда
-"
-        f"• `/работа` — подработка
-"
-        f"• `/колесо 500` — Колесо Фортуны
-"
-        f"• `/казино 500` — рулетка ставок
-"
-        f"• `/слоты 500` — автоматы
-"
-        f"• `/кубик 500` — кости с ботом
-"
+        f"🎮 **Игровой центр**\n"
+        f"💰 Ваш баланс: **{fmt_num(econ['balance'])} $**\n\n"
+        f"• `/бонус` — ежедневная награда\n"
+        f"• `/работа` — подработка\n"
+        f"• `/колесо 500` — Колесо Фортуны\n"
+        f"• `/казино 500` — рулетка ставок\n"
+        f"• `/слоты 500` — автоматы\n"
+        f"• `/кубик 500` — кости с ботом\n"
         f"• `/бизнесы` — покупка и доход с бизнеса"
     )
 
@@ -347,6 +401,63 @@ async def btn_reports(msg: Message):
 @bot.on.message(payload={"cmd": "dump_db"})
 async def btn_dump(msg: Message):
     await cmd_dump_db(msg)
+
+
+# ==============================================================================
+# НАСТРОЙКА ДОСТУПА КОМАНД ДЛЯ КОНКРЕТНОЙ БЕСЕДЫ (/доступ) — ОТ 95+ LVL
+# ==============================================================================
+@bot.on.message(text=["/доступ <cmd_name> <lvl_str>", "/доступ"])
+async def cmd_set_access(msg: Message, cmd_name: Optional[str] = None, lvl_str: Optional[str] = None):
+    if msg.peer_id < 2000000000:
+        await msg.answer("❌ Настройка прав команд работает только внутри беседы.")
+        return
+
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "доступ")
+    if not ok:
+        await msg.answer(f"⛔ Эта команда доступна с **{req}+ lvl** админки.")
+        return
+
+    if not cmd_name or not lvl_str or not lvl_str.isdigit():
+        avail = ", ".join(f"`{k}`" for k in sorted(DEFAULT_CMD_RANKS.keys()))
+        await msg.answer(
+            "⚙️ **Настройка ранга команды для этой беседы:**\n"
+            "Формат: `/доступ [команда] [ранг 0-100]`\n"
+            "Пример: `/доступ сник 60` или `/доступ сник 16`\n\n"
+            f"Доступные команды: {avail}"
+        )
+        return
+
+    clean_cmd = cmd_name.strip().lower().lstrip("/")
+    if clean_cmd not in DEFAULT_CMD_RANKS:
+        await msg.answer(f"❌ Команда `{clean_cmd}` не найдена в списке настраиваемых. Напишите `/доступ` для списка.")
+        return
+
+    new_lvl = int(lvl_str)
+    if not (0 <= new_lvl <= 100):
+        await msg.answer("❌ Ранг должен быть от `0` до `100`.")
+        return
+
+    chat = get_chat(msg.peer_id)
+    chat["cmd_ranks"][clean_cmd] = new_lvl
+    save_db(db)
+    await msg.answer(
+        f"✅ Для **этой беседы** команда `/{clean_cmd}` теперь доступна с **{new_lvl} lvl**!"
+    )
+
+
+@bot.on.message(text=["/доступы", "/права"])
+async def cmd_list_access(msg: Message):
+    if msg.peer_id < 2000000000:
+        await msg.answer("❌ Команда работает только в беседах.")
+        return
+    chat = get_chat(msg.peer_id)
+    custom = chat.get("cmd_ranks", {})
+    lines = ["🔐 **Требуемые ранги команд в этой беседе:**"]
+    for k, def_v in sorted(DEFAULT_CMD_RANKS.items()):
+        cur_v = int(custom.get(k, def_v))
+        mark = " *(изменено)*" if k in custom else ""
+        lines.append(f"• `/{k}` — **{cur_v} lvl**{mark}")
+    await msg.answer("\n".join(lines))
 
 
 # ==============================================================================
@@ -381,22 +492,15 @@ async def cmd_report(msg: Message, text: str):
 
     sender_name = await get_user_name(msg.from_id)
     await msg.answer(
-        f"✅ **Репорт #{rep_id} принят!**
-"
+        f"✅ **Репорт #{rep_id} принят!**\n"
         f"Ожидайте ответа администрации прямо в этот чат."
     )
 
-    # Уведомляем владельцев в ЛС о новом репорте
     alert = (
-        f"🚨 **Новый репорт #{rep_id}**
-"
-        f"👤 От: {sender_name}
-"
-        f"💬 Беседа: {chat_title} (`{msg.peer_id}`)
-"
-        f"📝 Текст: {text}
-
-"
+        f"🚨 **Новый репорт #{rep_id}**\n"
+        f"👤 От: {sender_name}\n"
+        f"💬 Беседа: {chat_title} (`{msg.peer_id}`)\n"
+        f"📝 Текст: {text}\n\n"
         f"👉 Ответить из любого чата: `/ответ {rep_id} ваш_текст`"
     )
     for oid in OWNER_IDS:
@@ -408,8 +512,9 @@ async def cmd_report(msg: Message, text: str):
 
 @bot.on.message(text=["/репорты", "/reports"])
 async def cmd_reports(msg: Message):
-    if get_rank(msg.peer_id, msg.from_id) < 50:
-        await msg.answer("⛔ Доступно администраторам с 50+ рангом.")
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "репорты")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
         return
     open_reps = [r for r in db["reports"] if r.get("status") == "open"]
     if not open_reps:
@@ -421,16 +526,15 @@ async def cmd_reports(msg: Message):
         lines.append(
             f"• **#{r['id']}** от [id{r['user_id']}|игрока] ({r.get('chat_title', 'чат')}): {r['text']}"
         )
-    lines.append("
-Ответить из любой беседы: `/ответ [ID] [текст ответа]`")
-    await msg.answer("
-".join(lines))
+    lines.append("\nОтветить из любой беседы: `/ответ [ID] [текст ответа]`")
+    await msg.answer("\n".join(lines))
 
 
 @bot.on.message(text=["/ответ <rep_id_str> <answer_text>", "/ответить <rep_id_str> <answer_text>"])
 async def cmd_answer_report(msg: Message, rep_id_str: str, answer_text: str):
-    if get_rank(msg.peer_id, msg.from_id) < 50:
-        await msg.answer("⛔ Отвечать на репорты могут только администраторы (50+ ранг).")
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "ответ")
+    if not ok:
+        await msg.answer(f"⛔ Отвечать на репорты можно с **{req}+ lvl**.")
         return
     if not rep_id_str.isdigit():
         await msg.answer("❌ Укажите числовой номер репорта: `/ответ 1 Текст ответа`")
@@ -452,14 +556,10 @@ async def cmd_answer_report(msg: Message, rep_id_str: str, answer_text: str):
     save_db(db)
 
     delivery_text = (
-        f"📨 **Ответ на ваш репорт #{rep_id}**
-"
-        f"👤 Игрок: {user_name}
-"
-        f"❓ Ваш вопрос: {target_rep['text']}
-"
-        f"🛡 Администратор: {admin_name}
-"
+        f"📨 **Ответ на ваш репорт #{rep_id}**\n"
+        f"👤 Игрок: {user_name}\n"
+        f"❓ Ваш вопрос: {target_rep['text']}\n"
+        f"🛡 Администратор: {admin_name}\n"
         f"💬 Ответ: **{answer_text.strip()}**"
     )
 
@@ -485,14 +585,12 @@ def collect_passive_income(econ: Dict[str, Any]) -> int:
     hours = (now - last) / 3600.0
     if hours <= 0:
         return 0
-    # Максимум накопления за 24 часа
     hours = min(hours, 24.0)
     hourly_total = 0
     for biz_id, lvl in econ.get("businesses", {}).items():
         if biz_id in BUSINESS_CATALOG:
             hourly_total += BUSINESS_CATALOG[biz_id]["income"] * int(lvl)
-    earned = int(hourly_total * hours)
-    return earned
+    return int(hourly_total * hours)
 
 
 @bot.on.message(text=["/баланс", "/б", "баланс"])
@@ -500,10 +598,8 @@ async def cmd_balance(msg: Message):
     econ = get_econ(msg.from_id)
     pending = collect_passive_income(econ)
     await msg.answer(
-        f"💳 **Финансы {await get_user_name(msg.from_id)}**
-"
-        f"💵 На руках: **{fmt_num(econ['balance'])} $**
-"
+        f"💳 **Финансы {await get_user_name(msg.from_id)}**\n"
+        f"💵 На руках: **{fmt_num(econ['balance'])} $**\n"
         f"🏢 Накоплено в бизнесах: **{fmt_num(pending)} $** (`/собрать`)"
     )
 
@@ -524,8 +620,7 @@ async def cmd_bonus(msg: Message):
     econ["balance"] += prize
     econ["last_bonus"] = now
     save_db(db)
-    await msg.answer(f"🎁 Вы забрали ежедневный бонус: **+{fmt_num(prize)} $**!
-💵 Баланс: **{fmt_num(econ['balance'])} $**")
+    await msg.answer(f"🎁 Вы забрали ежедневный бонус: **+{fmt_num(prize)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
 
 
 @bot.on.message(text=["/работа", "работа"])
@@ -548,8 +643,7 @@ async def cmd_work(msg: Message):
     econ["balance"] += pay
     econ["last_work"] = now
     save_db(db)
-    await msg.answer(f"🛠 Вы {job_desc} и заработали **+{fmt_num(pay)} $**!
-💵 Баланс: **{fmt_num(econ['balance'])} $**")
+    await msg.answer(f"🛠 Вы {job_desc} и заработали **+{fmt_num(pay)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
 
 
 @bot.on.message(text=["/перевод <target> <amount_str>"])
@@ -607,9 +701,7 @@ async def cmd_casino(msg: Message, bet_str: str):
         econ["balance"] += win
         res = f"🔥 ДЖЕКПОТ (x5)! Вы сорвали куш **+{fmt_num(win)} $**!"
     save_db(db)
-    await msg.answer(f"🎰 **Казино**
-{res}
-💵 Баланс: **{fmt_num(econ['balance'])} $**")
+    await msg.answer(f"🎰 **Казино**\n{res}\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
 
 
 @bot.on.message(text=["/колесо <bet_str>", "колесо <bet_str>"])
@@ -642,12 +734,9 @@ async def cmd_wheel(msg: Message, bet_str: str):
     diff = payout - bet
     sign = f"+{fmt_num(diff)}" if diff >= 0 else f"{fmt_num(diff)}"
     await msg.answer(
-        f"🎡 **Колесо Фортуны**
-"
-        f"Сектор: **{names[idx]}**
-"
-        f"Итог: **{sign} $**
-"
+        f"🎡 **Колесо Фортуны**\n"
+        f"Сектор: **{names[idx]}**\n"
+        f"Итог: **{sign} $**\n"
         f"💵 Баланс: **{fmt_num(econ['balance'])} $**"
     )
 
@@ -681,9 +770,7 @@ async def cmd_slots(msg: Message, bet_str: str):
         status = f"📉 Не повезло! Проигрыш: **-{fmt_num(bet)} $**"
 
     save_db(db)
-    await msg.answer(f"🎰 **Слоты:** {display}
-{status}
-💵 Баланс: **{fmt_num(econ['balance'])} $**")
+    await msg.answer(f"🎰 **Слоты:** {display}\n{status}\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
 
 
 @bot.on.message(text=["/кубик <bet_str>", "кубик <bet_str>"])
@@ -709,12 +796,9 @@ async def cmd_dice(msg: Message, bet_str: str):
         outcome = "🤝 Ничья! Ставка возвращена."
     save_db(db)
     await msg.answer(
-        f"🎲 **Кубики**
-"
-        f"Вы выбросили: **{p_roll}** | Бот выбросил: **{b_roll}**
-"
-        f"{outcome}
-💵 Баланс: **{fmt_num(econ['balance'])} $**"
+        f"🎲 **Кубики**\n"
+        f"Вы выбросили: **{p_roll}** | Бот выбросил: **{b_roll}**\n"
+        f"{outcome}\n💵 Баланс: **{fmt_num(econ['balance'])} $**"
     )
 
 
@@ -725,11 +809,8 @@ async def cmd_businesses(msg: Message):
         lines.append(
             f"**{bid}. {info['name']}** — Цена: **{fmt_num(info['cost'])} $** | Доход: **{fmt_num(info['income'])} $/ч**"
         )
-    lines.append("
-Купить или улучшить бизнес: `/купитьбиз [номер]`
-Забрать прибыль: `/собрать`")
-    await msg.answer("
-".join(lines))
+    lines.append("\nКупить или улучшить бизнес: `/купитьбиз [номер]`\nЗабрать прибыль: `/собрать`")
+    await msg.answer("\n".join(lines))
 
 
 @bot.on.message(text=["/купитьбиз <bid>"])
@@ -739,7 +820,6 @@ async def cmd_buy_biz(msg: Message, bid: str):
         await msg.answer("❌ Неверный номер бизнеса. Посмотрите `/бизнесы`.")
         return
     econ = get_econ(msg.from_id)
-    # Сначала начислим накопленное по старому уровню
     pending = collect_passive_income(econ)
     econ["balance"] += pending
     econ["last_collect"] = int(time.time())
@@ -750,8 +830,7 @@ async def cmd_buy_biz(msg: Message, bid: str):
 
     if econ["balance"] < price:
         await msg.answer(
-            f"❌ Для покупки/улучшения «{info['name']}» (ур. {cur_lvl + 1}) нужно **{fmt_num(price)} $**.
-"
+            f"❌ Для покупки/улучшения «{info['name']}» (ур. {cur_lvl + 1}) нужно **{fmt_num(price)} $**.\n"
             f"Ваш баланс: **{fmt_num(econ['balance'])} $**"
         )
         return
@@ -760,8 +839,7 @@ async def cmd_buy_biz(msg: Message, bid: str):
     econ["businesses"][bid] = cur_lvl + 1
     save_db(db)
     await msg.answer(
-        f"✅ Вы приобрели/улучшили **{info['name']}** до **{cur_lvl + 1} ур.** за **{fmt_num(price)} $**!
-"
+        f"✅ Вы приобрели/улучшили **{info['name']}** до **{cur_lvl + 1} ур.** за **{fmt_num(price)} $**!\n"
         f"📈 Новый доход: **{fmt_num(info['income'] * (cur_lvl + 1))} $/ч**"
     )
 
@@ -780,11 +858,9 @@ async def cmd_my_biz(msg: Message):
             total_hr += inc
             lines.append(f"• **{BUSINESS_CATALOG[bid]['name']}** ({lvl} ур.) — **{fmt_num(inc)} $/ч**")
     pending = collect_passive_income(econ)
-    lines.append(f"
-📊 Общий доход: **{fmt_num(total_hr)} $/ч**")
+    lines.append(f"\n📊 Общий доход: **{fmt_num(total_hr)} $/ч**")
     lines.append(f"💰 Накоплено в кассе: **{fmt_num(pending)} $** (`/собрать`)")
-    await msg.answer("
-".join(lines))
+    await msg.answer("\n".join(lines))
 
 
 @bot.on.message(text=["/собрать", "собрать"])
@@ -797,12 +873,11 @@ async def cmd_collect(msg: Message):
     econ["balance"] += earned
     econ["last_collect"] = int(time.time())
     save_db(db)
-    await msg.answer(f"💰 Вы собрали прибыль с бизнесов: **+{fmt_num(earned)} $**!
-💵 Баланс: **{fmt_num(econ['balance'])} $**")
+    await msg.answer(f"💰 Вы собрали прибыль с бизнесов: **+{fmt_num(earned)} $**!\n💵 Баланс: **{fmt_num(econ['balance'])} $**")
 
 
 # ==============================================================================
-# МОДЕРАЦИЯ, РАНГИ, УТИЛИТЫ БЕСЕД
+# МОДЕРАЦИЯ, РАНГИ, НИКИ (/ник И /сник) И ДОП. КОМАНДЫ БЕСЕД
 # ==============================================================================
 async def show_stats(msg: Message, target_id: int):
     rank = get_rank(msg.peer_id, target_id)
@@ -811,20 +886,21 @@ async def show_stats(msg: Message, target_id: int):
     warns = 0
     rep = 0
     nick = "Не установлен"
+    spouse_str = "Нет"
     if msg.peer_id > 2000000000:
         chat = get_chat(msg.peer_id)
         warns = int(chat["warns"].get(str(target_id), 0))
         rep = int(chat["rep"].get(str(target_id), 0))
         nick = chat["nicks"].get(str(target_id), "Не установлен")
+        spouse_id = chat.get("marriages", {}).get(str(target_id))
+        if spouse_id:
+            spouse_str = await get_user_name(int(spouse_id))
     await msg.answer(
-        f"📊 **Профиль:** {name}
-"
-        f"👑 Ранг: **{rank} lvl**
-"
-        f"🏷 Ник в чате: **{nick}**
-"
-        f"⭐ Репутация: **{rep}** | ⚠️ Варны: **{warns}/3**
-"
+        f"📊 **Профиль:** {name}\n"
+        f"👑 Ранг: **{rank} lvl**\n"
+        f"🏷 Ник в чате: **{nick}**\n"
+        f"💍 Брак: {spouse_str}\n"
+        f"⭐ Репутация: **{rep}** | ⚠️ Варны: **{warns}/3**\n"
         f"💵 Баланс: **{fmt_num(econ['balance'])} $**"
     )
 
@@ -840,6 +916,10 @@ async def cmd_set_rank(msg: Message, lvl_str: str, target: Optional[str] = None)
     if msg.peer_id < 2000000000:
         await msg.answer("❌ Команда работает в беседах.")
         return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "ранг")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
+        return
     tid = parse_target_id(msg, target)
     if not tid or not lvl_str.isdigit():
         await msg.answer("❌ Использование: `/ранг @пользователь 50` (или ответом на сообщение)")
@@ -849,8 +929,8 @@ async def cmd_set_rank(msg: Message, lvl_str: str, target: Optional[str] = None)
         await msg.answer("❌ Ранг должен быть от 0 до 100.")
         return
     caller_rank = get_rank(msg.peer_id, msg.from_id)
-    if caller_rank < 80 or (new_lvl >= caller_rank and not is_owner(msg.from_id)):
-        await msg.answer("⛔ Недостаточно прав для выдачи этого ранга.")
+    if new_lvl >= caller_rank and not is_owner(msg.from_id):
+        await msg.answer("⛔ Нельзя выдать ранг выше или равный своему.")
         return
     chat = get_chat(msg.peer_id)
     chat["ranks"][str(tid)] = new_lvl
@@ -871,13 +951,92 @@ async def cmd_admins(msg: Message):
             lines.append(f"• {await get_user_name(int(uid_str))} — **{lvl} lvl**")
     if not found:
         lines.append("Список локальных админов пуст.")
-    await msg.answer("
-".join(lines))
+    await msg.answer("\n".join(lines))
+
+
+# Свой ник (/ник) и чужой ник (/сник — по умолчанию с 15 lvl, настраивается через /доступ сник [ранг])
+@bot.on.message(text=["/ник <nick>"])
+async def cmd_self_nick(msg: Message, nick: str):
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "ник")
+    if not ok:
+        await msg.answer(f"⛔ Команда `/ник` доступна с **{req}+ lvl**.")
+        return
+    clean_nick = nick.strip()[:32]
+    chat = get_chat(msg.peer_id)
+    chat["nicks"][str(msg.from_id)] = clean_nick
+    save_db(db)
+    await msg.answer(f"🏷 Ваш новый ник в этой беседе: **{clean_nick}**")
+
+
+@bot.on.message(text=["/сник <target> <nick>", "/сник <nick>"])
+async def cmd_set_other_nick(msg: Message, nick: str, target: Optional[str] = None):
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "сник")
+    if not ok:
+        await msg.answer(f"⛔ Команда `/сник` в этой беседе доступна с **{req}+ lvl**.")
+        return
+    tid = parse_target_id(msg, target)
+    if not tid:
+        await msg.answer("❌ Укажите игрока: `/сник @пользователь НовыйНик` (или ответом на сообщение)")
+        return
+    clean_nick = nick.strip()[:32]
+    chat = get_chat(msg.peer_id)
+    chat["nicks"][str(tid)] = clean_nick
+    save_db(db)
+    await msg.answer(f"🏷 Игроку {await get_user_name(tid)} установлен ник: **{clean_nick}**")
+
+
+@bot.on.message(text=["/аварн <target> <reason>", "/аварн <target>", "/аварн"])
+async def cmd_admin_warn(msg: Message, target: Optional[str] = None, reason: str = "Нарушение регламента админов"):
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "аварн")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
+        return
+    tid = parse_target_id(msg, target)
+    if not tid:
+        return
+    chat = get_chat(msg.peer_id)
+    aw = int(chat["admin_warns"].get(str(tid), 0)) + 1
+    if aw >= 3:
+        chat["admin_warns"][str(tid)] = 0
+        chat["ranks"][str(tid)] = 0
+        save_db(db)
+        await msg.answer(f"🔻 Администратор {await get_user_name(tid)} получил **3/3 выговора** и был снят с поста!")
+    else:
+        chat["admin_warns"][str(tid)] = aw
+        save_db(db)
+        await msg.answer(f"📛 Администратору {await get_user_name(tid)} выдан выговор (**{aw}/3**).\nПричина: {reason}")
+
+
+@bot.on.message(text=["/снятьаварн", "/снятьаварн <target>"])
+async def cmd_remove_admin_warn(msg: Message, target: Optional[str] = None):
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "снятьаварн")
+    if not ok:
+        return
+    tid = parse_target_id(msg, target)
+    if not tid:
+        return
+    chat = get_chat(msg.peer_id)
+    aw = max(0, int(chat["admin_warns"].get(str(tid), 0)) - 1)
+    chat["admin_warns"][str(tid)] = aw
+    save_db(db)
+    await msg.answer(f"✅ Снят 1 админ-выговор у {await get_user_name(tid)} (**{aw}/3**).")
 
 
 @bot.on.message(text=["/мут <target> <mins_str> <reason>", "/мут <target> <mins_str>", "/мут <mins_str>"])
 async def cmd_mute(msg: Message, mins_str: str, target: Optional[str] = None, reason: str = "Нарушение правил"):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 30:
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "мут")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
         return
     tid = parse_target_id(msg, target)
     if not tid or not mins_str.isdigit():
@@ -887,13 +1046,15 @@ async def cmd_mute(msg: Message, mins_str: str, target: Optional[str] = None, re
     chat = get_chat(msg.peer_id)
     chat["mutes"][str(tid)] = time.time() + mins * 60
     save_db(db)
-    await msg.answer(f"🔇 {await get_user_name(tid)} получил мут на **{mins} мин.**
-Причина: {reason}")
+    await msg.answer(f"🔇 {await get_user_name(tid)} получил мут на **{mins} мин.**\nПричина: {reason}")
 
 
 @bot.on.message(text=["/размут", "/размут <target>"])
 async def cmd_unmute(msg: Message, target: Optional[str] = None):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 30:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "размут")
+    if not ok:
         return
     tid = parse_target_id(msg, target)
     if not tid:
@@ -906,7 +1067,11 @@ async def cmd_unmute(msg: Message, target: Optional[str] = None):
 
 @bot.on.message(text=["/варн <target> <reason>", "/варн <target>", "/варн"])
 async def cmd_warn(msg: Message, target: Optional[str] = None, reason: str = "Нарушение правил"):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 40:
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "варн")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
         return
     tid = parse_target_id(msg, target)
     if not tid:
@@ -924,13 +1089,15 @@ async def cmd_warn(msg: Message, target: Optional[str] = None, reason: str = "Н
     else:
         chat["warns"][str(tid)] = w
         save_db(db)
-        await msg.answer(f"⚠️ {await get_user_name(tid)} выдано предупреждение (**{w}/3**).
-Причина: {reason}")
+        await msg.answer(f"⚠️ {await get_user_name(tid)} выдано предупреждение (**{w}/3**).\nПричина: {reason}")
 
 
 @bot.on.message(text=["/разварн", "/разварн <target>"])
 async def cmd_unwarn(msg: Message, target: Optional[str] = None):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 40:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "разварн")
+    if not ok:
         return
     tid = parse_target_id(msg, target)
     if not tid:
@@ -944,22 +1111,29 @@ async def cmd_unwarn(msg: Message, target: Optional[str] = None):
 
 @bot.on.message(text=["/кик <target> <reason>", "/кик <target>", "/кик"])
 async def cmd_kick(msg: Message, target: Optional[str] = None, reason: str = "Решение администрации"):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 50:
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "кик")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
         return
     tid = parse_target_id(msg, target)
     if not tid:
         return
     try:
         await bot.api.messages.remove_chat_user(chat_id=msg.peer_id - 2000000000, member_id=tid)
-        await msg.answer(f"👢 {await get_user_name(tid)} исключён из беседы.
-Причина: {reason}")
+        await msg.answer(f"👢 {await get_user_name(tid)} исключён из беседы.\nПричина: {reason}")
     except Exception as e:
         await msg.answer(f"❌ Не удалось кикнуть (проверьте права администратора у бота): `{e}`")
 
 
 @bot.on.message(text=["/бан <target> <reason>", "/бан <target>", "/бан"])
 async def cmd_ban(msg: Message, target: Optional[str] = None, reason: str = "Бан в беседе"):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 60:
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "бан")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
         return
     tid = parse_target_id(msg, target)
     if not tid:
@@ -971,13 +1145,15 @@ async def cmd_ban(msg: Message, target: Optional[str] = None, reason: str = "Б�
         await bot.api.messages.remove_chat_user(chat_id=msg.peer_id - 2000000000, member_id=tid)
     except Exception:
         pass
-    await msg.answer(f"🔨 {await get_user_name(tid)} заблокирован в беседе.
-Причина: {reason}")
+    await msg.answer(f"🔨 {await get_user_name(tid)} заблокирован в беседе.\nПричина: {reason}")
 
 
 @bot.on.message(text=["/разбан <target>"])
 async def cmd_unban(msg: Message, target: str):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 60:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "разбан")
+    if not ok:
         return
     tid = parse_target_id(msg, target)
     if not tid:
@@ -990,9 +1166,10 @@ async def cmd_unban(msg: Message, target: str):
 
 @bot.on.message(text=["/чистка <count_str>"])
 async def cmd_clear(msg: Message, count_str: str):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 50:
+    if msg.peer_id < 2000000000:
         return
-    if not count_str.isdigit():
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "чистка")
+    if not ok or not count_str.isdigit():
         return
     cnt = min(max(1, int(count_str)), 100)
     cmids = list(range(max(1, msg.conversation_message_id - cnt), msg.conversation_message_id + 1))
@@ -1005,7 +1182,10 @@ async def cmd_clear(msg: Message, count_str: str):
 
 @bot.on.message(text=["/закреп"])
 async def cmd_pin(msg: Message):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 40:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "закреп")
+    if not ok:
         return
     if not msg.reply_message:
         await msg.answer("❌ Ответьте командой `/закреп` на сообщение, которое нужно закрепить.")
@@ -1019,7 +1199,10 @@ async def cmd_pin(msg: Message):
 
 @bot.on.message(text=["/чат лок", "/чат анлок"])
 async def cmd_chat_lock(msg: Message):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 60:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "чатлок")
+    if not ok:
         return
     chat = get_chat(msg.peer_id)
     lock = "лок" in msg.text.lower() and "анлок" not in msg.text.lower()
@@ -1028,9 +1211,31 @@ async def cmd_chat_lock(msg: Message):
     await msg.answer("🔒 Чат закрыт для обычных участников." if lock else "🔓 Чат снова открыт для всех!")
 
 
+@bot.on.message(text=["/приветствие <text>"])
+async def cmd_welcome_set(msg: Message, text: str):
+    if msg.peer_id < 2000000000:
+        return
+    ok, req = has_cmd_access(msg.peer_id, msg.from_id, "приветствие")
+    if not ok:
+        await msg.answer(f"⛔ Доступно с **{req}+ lvl**.")
+        return
+    chat = get_chat(msg.peer_id)
+    if text.strip().lower() in ("выкл", "off", "удалить"):
+        chat["welcome"] = ""
+        save_db(db)
+        await msg.answer("🔕 Приветствие новых участников отключено.")
+    else:
+        chat["welcome"] = text.strip()
+        save_db(db)
+        await msg.answer("✅ Приветствие сохранено! Используйте `{user}` для упоминания новичка.")
+
+
 @bot.on.message(text=["/защита <module> <state>"])
 async def cmd_guard_toggle(msg: Message, module: str, state: str):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 60:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "защита")
+    if not ok:
         return
     mapping = {
         "антиспам": "antispam",
@@ -1049,23 +1254,12 @@ async def cmd_guard_toggle(msg: Message, module: str, state: str):
     await msg.answer(f"🛡 Модуль **{module.lower()}** теперь **{'ВКЛЮЧЕН' if enabled else 'ВЫКЛЮЧЕН'}**.")
 
 
-@bot.on.message(text=["/ник <target> <nick>", "/ник <nick>"])
-async def cmd_nick(msg: Message, nick: str, target: Optional[str] = None):
-    if msg.peer_id < 2000000000:
-        return
-    tid = parse_target_id(msg, target) or msg.from_id
-    if tid != msg.from_id and get_rank(msg.peer_id, msg.from_id) < 40:
-        await msg.answer("⛔ Менять ник другим игрокам могут админы с 40+ рангом.")
-        return
-    chat = get_chat(msg.peer_id)
-    chat["nicks"][str(tid)] = nick.strip()[:32]
-    save_db(db)
-    await msg.answer(f"🏷 Игроку {await get_user_name(tid)} установлен ник: **{nick.strip()[:32]}**")
-
-
 @bot.on.message(text=["/лидер <faction> <target>", "/лидер <faction>"])
 async def cmd_leader(msg: Message, faction: str, target: Optional[str] = None):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 60:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "лидер")
+    if not ok:
         return
     tid = parse_target_id(msg, target)
     if not tid:
@@ -1087,18 +1281,35 @@ async def cmd_leaders(msg: Message):
     lines = ["🎖 **Действующие лидеры:**"]
     for fac, uid in chat["leaders"].items():
         lines.append(f"• **{fac}** — {await get_user_name(int(uid))}")
-    await msg.answer("
-".join(lines))
+    await msg.answer("\n".join(lines))
 
 
 @bot.on.message(text=["/заметка <name> <content>"])
 async def cmd_note_add(msg: Message, name: str, content: str):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 40:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "заметка")
+    if not ok:
         return
     chat = get_chat(msg.peer_id)
     chat["notes"][name.lower()] = content
     save_db(db)
     await msg.answer(f"📝 Заметка `{name.lower()}` сохранена.")
+
+
+@bot.on.message(text=["/удалзаметку <name>"])
+async def cmd_note_del(msg: Message, name: str):
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "удалзаметку")
+    if not ok:
+        return
+    chat = get_chat(msg.peer_id)
+    if chat["notes"].pop(name.lower(), None) is not None:
+        save_db(db)
+        await msg.answer(f"🗑 Заметка `{name.lower()}` удалена.")
+    else:
+        await msg.answer("❌ Такой заметки нет.")
 
 
 @bot.on.message(text=["/заметки"])
@@ -1112,8 +1323,7 @@ async def cmd_notes_list(msg: Message):
     lines = ["📚 **Заметки беседы:**"]
     for k, v in chat["notes"].items():
         lines.append(f"• **{k}**: {v}")
-    await msg.answer("
-".join(lines))
+    await msg.answer("\n".join(lines))
 
 
 @bot.on.message(text=["+реп", "-реп"])
@@ -1143,24 +1353,81 @@ async def cmd_top(msg: Message):
     lines = ["🏆 **Топ участников по репутации:**"]
     for idx, (uid, val) in enumerate(top_list, 1):
         lines.append(f"{idx}. {await get_user_name(int(uid))} — **{val}**")
-    await msg.answer("
-".join(lines))
+    await msg.answer("\n".join(lines))
 
 
 @bot.on.message(text=["/созыв <reason>", "/созыв"])
 async def cmd_mention_all(msg: Message, reason: str = "Общий сбор!"):
-    if msg.peer_id < 2000000000 or get_rank(msg.peer_id, msg.from_id) < 50:
+    if msg.peer_id < 2000000000:
+        return
+    ok, _ = has_cmd_access(msg.peer_id, msg.from_id, "созыв")
+    if not ok:
         return
     try:
         members = await bot.api.messages.get_conversation_members(peer_id=msg.peer_id)
-        mentions = []
-        for m in members.items:
-            if m.member_id > 0:
-                mentions.append(f"[id{m.member_id}|📣]")
-        await msg.answer(f"📢 **СОЗЫВ БЕСЕДЫ:** {reason}
-" + " ".join(mentions[:60]))
+        mentions = [f"[id{m.member_id}|📣]" for m in members.items if m.member_id > 0]
+        await msg.answer(f"📢 **СОЗЫВ БЕСЕДЫ:** {reason}\n" + " ".join(mentions[:60]))
     except Exception as e:
         await msg.answer(f"❌ Не удалось получить список участников (нужна админка боту): `{e}`")
+
+
+# ==============================================================================
+# ФАН-КОМАНДЫ ДЛЯ ИГРОКОВ (БРАКИ, ШАР СУДЬБЫ, ВЫБОР)
+# ==============================================================================
+@bot.on.message(text=["/брак <target>", "/брак"])
+async def cmd_marry(msg: Message, target: Optional[str] = None):
+    if msg.peer_id < 2000000000:
+        return
+    tid = parse_target_id(msg, target)
+    if not tid or tid == msg.from_id or tid < 0:
+        await msg.answer("❌ Укажите игрока для брака: `/брак @пользователь`")
+        return
+    chat = get_chat(msg.peer_id)
+    marriages = chat.setdefault("marriages", {})
+    if str(msg.from_id) in marriages or str(tid) in marriages:
+        await msg.answer("💔 Кто-то из вас уже состоит в браке в этой беседе!")
+        return
+    marriages[str(msg.from_id)] = tid
+    marriages[str(tid)] = msg.from_id
+    save_db(db)
+    await msg.answer(f"💍 Поздравляем! {await get_user_name(msg.from_id)} и {await get_user_name(tid)} теперь в браке!")
+
+
+@bot.on.message(text=["/развод"])
+async def cmd_divorce(msg: Message):
+    if msg.peer_id < 2000000000:
+        return
+    chat = get_chat(msg.peer_id)
+    marriages = chat.setdefault("marriages", {})
+    spouse = marriages.pop(str(msg.from_id), None)
+    if not spouse:
+        await msg.answer("❌ Вы не состоите в браке.")
+        return
+    marriages.pop(str(spouse), None)
+    save_db(db)
+    await msg.answer(f"💔 Брак между {await get_user_name(msg.from_id)} и {await get_user_name(int(spouse))} расторгнут.")
+
+
+@bot.on.message(text=["/шар <question>"])
+async def cmd_8ball(msg: Message, question: str):
+    answers = [
+        "Бесспорно, да! ✅",
+        "Скорее всего, да 👍",
+        "Звёзды говорят — нет ❌",
+        "Спроси позже, сейчас туманно 🔮",
+        "100% инфа, так и будет 🔥",
+        "Даже не надейся 😅",
+    ]
+    await msg.answer(f"🎱 **Шар судьбы:** {random.choice(answers)}")
+
+
+@bot.on.message(text=["/выбор <options>"])
+async def cmd_choose(msg: Message, options: str):
+    parts = [p.strip() for p in re.split(r"\s+или\s+|,", options, flags=re.I) if p.strip()]
+    if len(parts) < 2:
+        await msg.answer("❌ Напишите минимум 2 варианта через «или»: `/выбор чай или кофе`")
+        return
+    await msg.answer(f"🎯 Я выбираю: **{random.choice(parts)}**")
 
 
 # ==============================================================================
@@ -1174,9 +1441,7 @@ async def cmd_broadcast(msg: Message, text: str):
 
     sent_ok = 0
     sent_err = 0
-    broadcast_msg = f"📢 **Объявление от администрации GAMES:**
-
-{text.strip()}"
+    broadcast_msg = f"📢 **Объявление от администрации GAMES:**\n\n{text.strip()}"
 
     for pid_str in list(db["chats"].keys()):
         pid = int(pid_str)
@@ -1192,10 +1457,8 @@ async def cmd_broadcast(msg: Message, text: str):
             sent_err += 1
 
     await msg.answer(
-        f"✅ **Рассылка завершена!**
-"
-        f"📨 Доставлено в бесед: **{sent_ok}**
-"
+        f"✅ **Рассылка завершена!**\n"
+        f"📨 Доставлено в бесед: **{sent_ok}**\n"
         f"⚠️ Ошибок отправки: **{sent_err}**"
     )
 
@@ -1222,21 +1485,14 @@ async def cmd_dump_db(msg: Message):
         return
 
     summary = (
-        f"💾 **Сводка базы данных GAMES | Чат Менеджер**
-"
-        f"• Активных бесед: **{len(db['chats'])}**
-"
-        f"• Игроков в экономике: **{len(db['economy'])}**
-"
+        f"💾 **Сводка базы данных GAMES | Чат Менеджер**\n"
+        f"• Активных бесед: **{len(db['chats'])}**\n"
+        f"• Игроков в экономике: **{len(db['economy'])}**\n"
         f"• Всего репортов: **{len(db['reports'])}**"
     )
     raw = json.dumps(db, ensure_ascii=False, indent=2)
     if len(raw) <= 3500:
-        await msg.answer(f"{summary}
-
-```json
-{raw}
-```")
+        await msg.answer(f"{summary}\n\n```json\n{raw}\n```")
     else:
         await msg.answer(summary)
         for i in range(0, len(raw), 3800):
